@@ -10,6 +10,7 @@ def extract_json(
 ) -> object:
     if not endpoint or not model or not prompt or not snapshot:
         raise ValueError("Endpoint, model, prompt, and snapshot are required.")
+    endpoint = normalize_endpoint(endpoint)
     headers = {"Content-Type": "application/json"}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
@@ -39,6 +40,13 @@ def extract_json(
         return json.loads(content)
     except json.JSONDecodeError as exc:
         raise ValueError("The LLM returned text that was not valid JSON.") from exc
+
+
+def normalize_endpoint(endpoint: str) -> str:
+    endpoint = endpoint.strip()
+    if endpoint.rstrip("/").endswith(("/openai", "/v1", "/v1beta")):
+        return endpoint.rstrip("/") + "/chat/completions"
+    return endpoint
 
 
 def generate_schema(endpoint: str, model: str, api_key: str, prompt: str) -> dict:
