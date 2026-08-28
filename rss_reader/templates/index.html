@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Autofeedly</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}"><link rel="stylesheet" href="{{ url_for('static', filename='theme.css') }}">
+</head>
+<body>
+  <header><div><h1>Autofeedly</h1></div><div><a href="/">Overview</a> &nbsp; <a href="/pipelines">Pipelines</a> &nbsp; <button class="theme-toggle" aria-label="Toggle dark mode" title="Toggle dark mode">◐</button> &nbsp; <span id="status">Ready</span></div></header>
+  <main>
+    <aside>
+      <div class="side-head"><h2>Library</h2><button id="add-folder">+ Folder</button></div>
+      <button id="add-feed" class="wide">Add RSS feed</button>
+      <div id="folders"></div>
+      <button id="snapshot-feeds" class="wide">Snapshot selected feeds</button>
+    </aside>
+    <section class="items"><div class="section-head"><h2 id="feed-title">Choose a feed</h2><div class="schedules"><select id="refresh"><option value="0">Refresh off</option><option value="900000">Refresh 15m</option><option value="1800000">Refresh 30m</option><option value="3600000">Refresh 1h</option><option value="21600000">Refresh 6h</option><option value="custom">Refresh custom</option></select><input id="refresh-custom" type="number" min="1" placeholder="min" hidden></div></div><div class="bulkbar"><label><input id="select-all" type="checkbox"> Select all articles</label><button id="extract-selected">Extract selected</button><div class="snapshot-schedule"><select id="snapshot"><option value="0">Snapshot off</option><option value="1800000">Snapshot 30m</option><option value="3600000">Snapshot 1h</option><option value="21600000">Snapshot 6h</option><option value="custom">Snapshot custom</option></select><input id="snapshot-custom" type="number" min="1" placeholder="min" hidden></div></div><div id="items" class="item-list"></div></section>
+    <article><div class="article-head"><h2 id="article-title">No article selected</h2><div><button id="export">Save Article as TXT</button><button id="open">Open link</button></div></div><p id="article-meta"></p><div id="article-text" class="article-text">Select an item to extract the complete visible page.</div><div id="article-links"></div><section class="llm-panel"><h2>LLM JSON extraction</h2><div class="llm-grid"><input id="llm-endpoint" placeholder="OpenAI-compatible endpoint" value="https://api.openai.com/v1/chat/completions"><input id="llm-model" placeholder="Model, e.g. gpt-4o-mini"><input id="llm-key" type="password" placeholder="API key (not stored)"></div><textarea id="llm-prompt" placeholder="What should the model extract? e.g. Extract company, date, amount, and return them as JSON."></textarea><button id="llm-run">Extract snapshot to JSON</button><pre id="llm-result">No JSON result yet.</pre></section></article>
+  </main>
+  <script src="{{ url_for('static', filename='theme.js') }}"></script><script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>
