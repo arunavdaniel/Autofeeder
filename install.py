@@ -351,10 +351,19 @@ def create_venv(python_exe: Path, venv_dir: Path, dry_run: bool) -> Path:
         return venv_dir / ("Scripts" if platform.system() == "Windows" else "bin") / "python"
 
     info(f"Creating virtual environment in {venv_dir} …")
-    subprocess.check_call(
-        [str(python_exe), "-m", "venv", "--upgrade-deps", str(venv_dir)],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-    )
+    try:
+        # Standard venv creation without --upgrade-deps (which attempts PyPI connections)
+        subprocess.check_call(
+            [str(python_exe), "-m", "venv", str(venv_dir)],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+    except subprocess.CalledProcessError:
+        # Fallback if standard venv creation fails
+        subprocess.check_call(
+            [str(python_exe), "-m", "venv", "--without-pip", str(venv_dir)],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+
     system = platform.system()
     venv_python = venv_dir / ("Scripts" if system == "Windows" else "bin") / (
         "python.exe" if system == "Windows" else "python3"
@@ -380,28 +389,124 @@ def pip_install(venv_python: Path, *args: str, dry_run: bool = False) -> None:
     ok("Package installed.")
 
 
+def extract_offline_playwright_browsers(tmp_path: Path, dry_run: bool) -> None:
+    browsers_dir = tmp_path / "browsers"
+    if not browsers_dir.is_dir() or not any(browsers_dir.iterdir()):
+        return
+
+    system = platform.system()
+    if system == "Darwin":
+        pw_target = Path.home() / "Library" / "Caches" / "ms-playwright"
+    elif system == "Windows":
+        pw_target = Path(os.environ.get("LOCALAPPDATA", "")) / "ms-playwright"
+    else:
+        pw_target = Path.home() / ".cache" / "ms-playwright"
+
+    if dry_run:
+        info(f"[dry-run] Would unpack offline Playwright browsers to {pw_target}")
+        return
+
+    info(f"Installing offline Playwright browsers to {pw_target} …")
+    pw_target.mkdir(parents=True, exist_ok=True)
+    for item in browsers_dir.iterdir():
+        if item.is_dir():
+            target_item = pw_target / item.name
+            if target_item.exists():
+                shutil.rmtree(target_item)
+            shutil.copytree(item, target_item)
+            ok(f"Installed browser: {item.name}")
+
+
 def install_from_bundle(venv_python: Path, bundle_zip: Path, dry_run: bool) -> None:
     """Install from a local zip (offline mode)."""
     if not bundle_zip.exists():
         raise FileNotFoundError(f"Bundle not found: {bundle_zip}")
 
+    if dry_run:
+        info(f"[dry-run] Would unpack and install from bundle: {bundle_zip}")
+        return
+
     with tempfile.TemporaryDirectory() as tmp:
         info(f"Unpacking bundle {bundle_zip.name} …")
         with zipfile.ZipFile(bundle_zip) as zf:
             zf.extractall(tmp)
-        # Expect either a wheel, a tarball, or a pyproject.toml-based tree
-        wheels = list(Path(tmp).rglob("*.whl"))
-        sdists = list(Path(tmp).rglob("*.tar.gz"))
-        pyproject = list(Path(tmp).rglob("pyproject.toml"))
 
-        if wheels:
-            pip_install(venv_python, str(wheels[0]), "--no-index", dry_run=dry_run)
-        elif sdists:
-            pip_install(venv_python, str(sdists[0]), "--no-index", dry_run=dry_run)
-        elif pyproject:
-            pip_install(venv_python, str(pyproject[0].parent), "--no-index", dry_run=dry_run)
-        else:
-            raise RuntimeError("Bundle does not contain a wheel, sdist, or pyproject.toml.")
+        tmp_path = Path(tmp)
+        wheels = list(tmp_path.rglob("*.whl"))
+        sdists = list(tmp_path.rglob("*.tar.gz"))
+        pyprojects = list(tmp_path.rglob("pyproject.toml"))
+
+        wheel_dirs = list(set(w.parent for w in wheels))
+
+        if wheel_dirs:
+            wdir = wheel_dirs[0]
+            info(f"Found offline wheel cache at {wdir.name} ({len(wheels)} wheels).")
+            # Step 1: Install setuptools, wheel, pip from offline wheel directory first
+            subprocess.run(
+                [
+                    str(venv_python), "-m", "pip", "install", "--no-index",
+                    "--find-links", str(wdir), "setuptools", "wheel", "pip"
+                ],
+                capture_output=True,
+            )
+
+            # Step 2: Try installing rss-text-reader directly using --find-links
+            res = subprocess.run(
+                [
+                    str(venv_python), "-m", "pip", "install", "--no-index",
+                    "--find-links", str(wdir), "rss-text-reader"
+                ],
+                capture_output=True,
+                text=True,
+            )
+            if res.returncode == 0:
+                ok("Installed Autofeeder and dependencies from offline wheel cache.")
+                extract_offline_playwright_browsers(tmp_path, dry_run)
+                return
+
+            # Step 3: Install all wheels in wheel_dir
+            whl_paths = [str(w) for w in wheels]
+            res_all = subprocess.run(
+                [
+                    str(venv_python), "-m", "pip", "install", "--no-index",
+                    "--find-links", str(wdir)
+                ] + whl_paths,
+                capture_output=True,
+                text=True,
+            )
+            if res_all.returncode == 0:
+                ok("Installed all offline package wheels.")
+                extract_offline_playwright_browsers(tmp_path, dry_run)
+                return
+
+        # Fallback for sdist or source tree bundle
+        if pyprojects or sdists:
+            target = str(pyprojects[0].parent) if pyprojects else str(sdists[0])
+            find_links = ["--find-links", str(wheel_dirs[0])] if wheel_dirs else []
+
+            if wheel_dirs:
+                subprocess.run(
+                    [
+                        str(venv_python), "-m", "pip", "install", "--no-index",
+                        "--find-links", str(wheel_dirs[0]), "setuptools", "wheel"
+                    ],
+                    capture_output=True,
+                )
+
+            cmd = [
+                str(venv_python), "-m", "pip", "install", "--no-index", "--no-build-isolation"
+            ] + find_links + [target]
+
+            res = subprocess.run(cmd, capture_output=True, text=True)
+            if res.returncode != 0:
+                print(res.stdout[-2000:] if res.stdout else "")
+                print(res.stderr[-2000:] if res.stderr else "", file=sys.stderr)
+                raise RuntimeError(f"Offline bundle install failed (exit {res.returncode})")
+            ok("Installed package from source bundle.")
+            extract_offline_playwright_browsers(tmp_path, dry_run)
+            return
+
+        raise RuntimeError("Bundle does not contain wheels, sdist, or pyproject.toml.")
 
 
 # ---------------------------------------------------------------------------
