@@ -41,6 +41,8 @@ import re
 PYPI_PACKAGE = "rss-text-reader"
 GITHUB_REPO = "https://github.com/arunavdaniel/Autofeeder"
 GITHUB_RELEASES_API = "https://api.github.com/repos/arunavdaniel/Autofeeder/releases/latest"
+# Direct zip of the main branch — always available, no formal release required
+GITHUB_ARCHIVE_URL = "https://github.com/arunavdaniel/Autofeeder/archive/refs/heads/main.zip"
 DEFAULT_INSTALL_DIR = Path.home() / ".autofeeder"
 MIN_PYTHON = (3, 10)
 APP_NAME = "Autofeeder"
@@ -615,26 +617,40 @@ def main() -> int:
         error("--offline set but no --bundle provided.")
         return 1
     elif args.dry_run:
-        info(f"[dry-run] Would install '{PYPI_PACKAGE}' from PyPI or GitHub releases.")
+        info(f"[dry-run] Would install '{PYPI_PACKAGE}' from PyPI, GitHub release, or main branch.")
     else:
-        # Try PyPI first (simplest), fall back to GitHub zip
+        # 1. Try PyPI (fastest, cleanest)
         pypi_ver = latest_pypi_version(opener)
         if pypi_ver:
             version_spec = f"=={args.version}" if args.version else ""
+            info(f"Installing from PyPI ({PYPI_PACKAGE}{version_spec}) …")
             pip_install(venv_python, f"{PYPI_PACKAGE}{version_spec}", dry_run=args.dry_run)
         else:
-            warn("PyPI unavailable or package not published — trying GitHub releases …")
-            zip_url = latest_github_release_zip(opener, args.version)
-            if not zip_url:
-                error(
-                    "Could not reach PyPI or GitHub releases.\n"
-                    "    Use --offline --bundle /path/to/bundle.zip for air-gapped installs."
-                )
-                return 1
-            with tempfile.TemporaryDirectory() as tmp:
-                archive = Path(tmp) / "release.zip"
-                download(zip_url, archive, opener, f"{APP_NAME} source zip")
-                install_from_bundle(venv_python, archive, args.dry_run)
+            # 2. Try a tagged GitHub release (if --version specified or a release exists)
+            zip_url = latest_github_release_zip(opener, args.version) if not args.version else None
+            if args.version:
+                zip_url = latest_github_release_zip(opener, args.version)
+
+            if zip_url:
+                info(f"Installing from GitHub release …")
+                with tempfile.TemporaryDirectory() as tmp:
+                    archive = Path(tmp) / "release.zip"
+                    download(zip_url, archive, opener, f"{APP_NAME} release zip")
+                    install_from_bundle(venv_python, archive, args.dry_run)
+            else:
+                # 3. Fall back to the main branch archive — always available
+                info("Installing from GitHub main branch …")
+                with tempfile.TemporaryDirectory() as tmp:
+                    archive = Path(tmp) / "main.zip"
+                    try:
+                        download(GITHUB_ARCHIVE_URL, archive, opener, f"{APP_NAME} source (main branch)")
+                        install_from_bundle(venv_python, archive, args.dry_run)
+                    except Exception as exc:
+                        error(
+                            f"All install sources failed: {exc}\n"
+                            "    For air-gapped machines use: python3 install.py --offline --bundle /path/to/bundle.zip"
+                        )
+                        return 1
 
     # ------------------------------------------------------------------ #
     header("Step 5 — Playwright browser")
