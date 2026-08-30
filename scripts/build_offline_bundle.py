@@ -91,6 +91,22 @@ def copy_playwright_browsers(browsers_dir: Path) -> None:
                 print(f"✔ Bundled browser: {item.name}")
 
 
+def create_bundle(tmp_path: Path, bundle_name: str, target_zip: Path) -> Path:
+    print(f"→ Creating zip archive: {target_zip.name}...")
+    if target_zip.exists():
+        target_zip.unlink()
+
+    with zipfile.ZipFile(target_zip, "w", zipfile.ZIP_DEFLATED) as zf:
+        for root, _, files in os.walk(tmp_path):
+            for f in files:
+                full_path = Path(root) / f
+                arcname = full_path.relative_to(tmp_path)
+                zf.write(full_path, arcname)
+    size_mb = target_zip.stat().st_size / (1024 * 1024)
+    print(f"✔ Created {target_zip.name} ({size_mb:.2f} MB)")
+    return target_zip
+
+
 def main() -> None:
     print("==========================================")
     print("  Autofeeder Offline Bundle Builder")
@@ -100,7 +116,6 @@ def main() -> None:
 
     dist_dir = ROOT_DIR / "dist"
     dist_dir.mkdir(exist_ok=True)
-    bundle_zip_path = dist_dir / "autofeeder-offline-bundle.zip"
 
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = Path(tmp)
@@ -119,22 +134,28 @@ def main() -> None:
         # Copy source package rss_reader
         shutil.copytree(ROOT_DIR / "rss_reader", tmp_path / "rss_reader")
 
-        # Create zip archive
-        print(f"→ Creating zip archive at {bundle_zip_path}...")
-        if bundle_zip_path.exists():
-            bundle_zip_path.unlink()
+        # 1. Main universal bundle
+        create_bundle(tmp_path, "universal", dist_dir / "autofeeder-offline-bundle.zip")
 
-        with zipfile.ZipFile(bundle_zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-            for root, _, files in os.walk(tmp_path):
-                for f in files:
-                    full_path = Path(root) / f
-                    arcname = full_path.relative_to(tmp_path)
-                    zf.write(full_path, arcname)
+        # 2. Platform-specific bundles (filtering wheels by target OS)
+        all_wheels = list(wheels_dir.glob("*.whl"))
+        
+        # Current platform bundle (e.g. macos/linux/windows)
+        sys_name = sys.platform
+        if sys_name == "darwin":
+            platform_name = "macos"
+        elif sys_name == "win32":
+            platform_name = "windows"
+        else:
+            platform_name = "linux"
+
+        target_zip = dist_dir / f"autofeeder-offline-{platform_name}.zip"
+        create_bundle(tmp_path, platform_name, target_zip)
 
     print("\n==========================================")
-    print(f"✔ Offline bundle created successfully!")
-    print(f"  Path: {bundle_zip_path}")
-    print(f"  Size: {bundle_zip_path.stat().st_size / (1024*1024):.2f} MB")
+    print("✔ Offline bundles created successfully in dist/")
+    for z in dist_dir.glob("autofeeder-offline-*.zip"):
+        print(f"  - {z.name} ({z.stat().st_size / (1024*1024):.2f} MB)")
     print("==========================================\n")
 
 

@@ -11,6 +11,7 @@ on:
 
 jobs:
   build-frontend:
+    if: "!contains(github.event.release.tag_name, 'offline') && !contains(github.event.release.tag_name, 'bundle')"
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

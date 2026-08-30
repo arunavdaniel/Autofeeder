@@ -104,8 +104,9 @@ python3 install.py --version 0.2.1
 # Corporate SSL inspection / custom CA certificate
 python3 install.py --ca-bundle /etc/ssl/corporate-ca.pem
 
-# Fully offline / air-gapped — requires a pre-downloaded bundle zip
-python3 install.py --offline --bundle ~/Downloads/autofeeder-offline-bundle.zip
+# Fully offline / air-gapped — requires a platform-specific pre-downloaded bundle zip
+# Download: autofeeder-offline-macos.zip / autofeeder-offline-linux.zip / autofeeder-offline-windows.zip
+python3 install.py --offline --bundle ~/Downloads/autofeeder-offline-macos.zip
 
 # Preview what would happen without making any changes
 python3 install.py --dry-run
