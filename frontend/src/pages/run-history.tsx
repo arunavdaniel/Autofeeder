@@ -140,7 +140,7 @@ export function RunHistory() {
 
   if (id && detail) {
     const parsed = safeJsonParse<Record<string, unknown>>(detail.result || "{}", {});
-    const result =
+    const result: any =
       parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
     const pct =
       detail.progress_total > 0
@@ -151,7 +151,7 @@ export function RunHistory() {
       detail.pipeline_name ||
       pipelines.find((p) => p.id === detail.pipeline_id)?.name ||
       `Pipeline #${detail.pipeline_id}`;
-    const outputInfo =
+    const outputInfo: any =
       result.output ||
       (detail.output_info ? safeJsonParse(detail.output_info, null) : null);
     const running = detail.status === "running" || detail.status === "queued";

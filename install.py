@@ -628,6 +628,9 @@ def main() -> int:
     if args.no_browser:
         info("Skipping Playwright browser download (--no-browser).")
     else:
+        if not args.dry_run:
+            # Install the optional [browser] extra to get the playwright package
+            pip_install(venv_python, f"{PYPI_PACKAGE}[browser]", dry_run=False)
         install_playwright(venv_python, args.dry_run)
 
     # ------------------------------------------------------------------ #

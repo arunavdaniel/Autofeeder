@@ -10,10 +10,10 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "beautifulsoup4>=4.12",
+    "duckdb>=1.1",
     "feedparser>=6.0",
     "flask>=3.0",
     "jsonschema>=4.23",
-    "playwright>=1.62",
     "requests>=2.31",
     "trafilatura>=2.2",
 ]
@@ -22,6 +22,7 @@ dependencies = [
 rss-text-reader = "rss_reader.web:main"
 
 [project.optional-dependencies]
+browser = ["playwright>=1.62"]
 sync = [
     "psycopg[binary]>=3.1",
     "pymysql>=1.1",
@@ -34,7 +35,12 @@ embeddings = ["sentence-transformers>=3"]
 include = ["rss_reader*"]
 
 [tool.setuptools.package-data]
-rss_reader = ["data/*.json", "data/catalog_snapshots/*.json"]
+rss_reader = [
+    "data/*.json",
+    "data/catalog_snapshots/*.json",
+    "frontend_dist/**/*",
+    "frontend_dist/assets/*",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
