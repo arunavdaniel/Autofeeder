@@ -1,6 +1,26 @@
-# Autofeeder
+<p align="center">
+  <img src="docs/images/icon.svg" width="128" height="128" alt="Autofeeder Logo" />
+  <h1 align="center">Autofeeder</h1>
+  <p align="center">
+    <b>Local-first intelligence extraction.</b> Point it at RSS feeds, websites, or APIs. Define what you want to pull out. Get a structured DuckDB table on your machine — no cloud, no accounts, no data leaving your box.
+  </p>
+</p>
 
-> **Local-first intelligence extraction.** Point it at RSS feeds, websites, or APIs. Define what you want to pull out. Get a structured DuckDB table on your machine — no cloud, no accounts, no data leaving your box.
+---
+
+## Screenshots Showcase
+
+| Overview & Health | Sources & Discovery |
+| :---: | :---: |
+| ![Overview](docs/images/overview.png) | ![Discover](docs/images/discover.png) |
+
+| Extraction Pipelines | Built-in DuckDB SQL Viewer |
+| :---: | :---: |
+| ![Pipelines](docs/images/pipelines.png) | ![DuckDB Viewer](docs/images/duckdb.png) |
+
+| Website Change Monitor | Local Embeddings & Semantic Search |
+| :---: | :---: |
+| ![Websites](docs/images/websites.png) | ![Embeddings](docs/images/embeddings.png) |
 
 ---
 
@@ -40,7 +60,7 @@ Autofeeder is an end-to-end extraction pipeline that runs entirely on your machi
 SOURCES  →  FETCH  →  SNAPSHOT  →  TEXT EXTRACTION  →  LLM  →  DUCKDB
   RSS            HTTP/browser     trafilatura          any      queryable
   Atom           or Playwright    clean text        OpenAI-    structured
-  Websites                                         compat     table
+  Websites       / Selenium                        compat     table
   APIs
 ```
 
@@ -85,7 +105,7 @@ python3 install.py --version 0.2.1
 python3 install.py --ca-bundle /etc/ssl/corporate-ca.pem
 
 # Fully offline / air-gapped — requires a pre-downloaded bundle zip
-python3 install.py --offline --bundle ~/Downloads/autofeeder-bundle.zip
+python3 install.py --offline --bundle ~/Downloads/autofeeder-offline-bundle.zip
 
 # Preview what would happen without making any changes
 python3 install.py --dry-run
@@ -130,7 +150,7 @@ If Autofeeder is already running, the launcher detects it and just opens your br
 | **Overview** | Dashboard: counts of feeds, pipelines, runs, records extracted, errors. Last run summary. |
 | **Sources** | Add/edit/delete RSS & Atom feeds. Group into folders. Auto-refresh every 15 m / 30 m / 1 h / 6 h. Optional Playwright browser fetch for JS-heavy sites. |
 | **Discover** | Browse a curated catalog of feeds and websites to add in one click. |
-| **Websites** | Monitor any public URL. HTTP or Playwright. Change detection via content hash. Diff review. Feed changes into pipelines. |
+| **Websites** | Monitor any public URL. HTTP, Playwright, or Selenium. Change detection via content hash. Diff review. Feed changes into pipelines. |
 | **Schemas** | Define reusable extraction schemas: field name, type, description, required flag, default value. |
 | **Pipelines** | Compose a run: source → LLM endpoint + model + prompt → schema → DuckDB output (append / overwrite / upsert, dedupe key). Preview one article before saving. Retries, concurrency, timeout. |
 | **DuckDB** | SQL viewer: browse databases, open tables, run read-only or write queries, rename/delete databases and tables. |
@@ -191,7 +211,7 @@ Configure in **Settings → LLM**. The key is used only for the duration of the 
 ## Optional extras
 
 ```bash
-# Playwright browser (for JS-heavy article fetching)
+# Playwright & Selenium browsers (for JS-heavy article fetching)
 pip install 'autofeeder[browser]'
 python -m playwright install chromium
 
@@ -224,6 +244,12 @@ Build the frontend (only needed when editing frontend source):
 cd frontend
 npm install
 npm run build                    # output goes to rss_reader/frontend_dist/
+```
+
+Build offline installer bundle:
+
+```bash
+python scripts/build_offline_bundle.py
 ```
 
 ---
@@ -266,6 +292,7 @@ flowchart TB
 
 ```
 Autofeeder/
+├── docs/images/                # Screenshots and logo assets for documentation
 ├── rss_reader/                 # Python backend (Flask)
 │   ├── web.py                  # REST API + SPA serving
 │   ├── database.py             # SQLite metadata (feeds, schemas, pipelines, runs)
@@ -273,7 +300,7 @@ Autofeeder/
 │   ├── extractor.py            # extraction orchestration
 │   ├── llm.py                  # OpenAI-compatible LLM client
 │   ├── feeds.py                # RSS/Atom fetch + parse
-│   ├── fetchers.py             # HTTP + Playwright fetcher abstraction
+│   ├── fetchers.py             # HTTP, Playwright & Selenium fetcher abstraction
 │   ├── pipeline.py             # pipeline runner + scheduler loop
 │   ├── chunker.py              # paragraph/sentence chunking
 │   ├── embeddings.py           # embedding provider abstraction
@@ -289,10 +316,12 @@ Autofeeder/
 │       ├── pages/              # one file per page/route
 │       ├── components/         # ui primitives, layout, charts
 │       └── lib/                # api.ts, types.ts, utils
+├── scripts/
+│   └── build_offline_bundle.py # generates self-contained offline installer zip
 ├── install.py                  # cross-platform one-line installer
 ├── install.sh                  # macOS/Linux curl wrapper
 ├── install.ps1                 # Windows PowerShell wrapper
-├── packaging/                  # PyInstaller spec (native app builds)
+├── packaging/                  # PyInstaller spec & logo assets
 ├── tests/
 └── pyproject.toml
 ```
