@@ -52,24 +52,26 @@ if ($null -eq $PythonCmd) {
 
 Write-Host "  Found Python: $PythonCmd" -ForegroundColor Green
 
-# Download install.py
-Write-Host "  Downloading installer..." -ForegroundColor DarkGray
-$TempFile = [System.IO.Path]::GetTempFileName() + ".py"
-try {
-    # Use TLS 1.2+ (required by many corporate proxies)
-    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls13
-
-    $WebClient = New-Object System.Net.WebClient
-
-    # Respect system proxy settings (NTLM/Kerberos auth for corporate proxies)
-    $WebClient.Proxy = [System.Net.WebRequest]::GetSystemWebProxy()
-    $WebClient.Proxy.Credentials = [System.Net.CredentialCache]::DefaultNetworkCredentials
-
-    $WebClient.DownloadFile($InstallScriptUrl, $TempFile)
-} catch {
-    Write-Host "  Download failed: $_" -ForegroundColor Red
-    Write-Host "  Try: Download install.py manually and run: python install.py" -ForegroundColor Yellow
-    exit 1
+# Obtain install.py (check local file first before attempting network download)
+$LocalInstaller = Join-Path -Path $PSScriptRoot -ChildPath "install.py"
+if (-not [string]::IsNullOrEmpty($PSScriptRoot) -and (Test-Path $LocalInstaller)) {
+    $TempFile = $LocalInstaller
+    $CleanupTemp = $false
+} else {
+    Write-Host "  Downloading installer..." -ForegroundColor DarkGray
+    $TempFile = [System.IO.Path]::GetTempFileName() + ".py"
+    $CleanupTemp = $true
+    try {
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls13
+        $WebClient = New-Object System.Net.WebClient
+        $WebClient.Proxy = [System.Net.WebRequest]::GetSystemWebProxy()
+        $WebClient.Proxy.Credentials = [System.Net.CredentialCache]::DefaultNetworkCredentials
+        $WebClient.DownloadFile($InstallScriptUrl, $TempFile)
+    } catch {
+        Write-Host "  Download failed: $_" -ForegroundColor Red
+        Write-Host "  Try: Download install.py manually and run: python install.py" -ForegroundColor Yellow
+        exit 1
+    }
 }
 
 # Build argument list
@@ -92,5 +94,5 @@ try {
     }
     exit $LASTEXITCODE
 } finally {
-    if (Test-Path $TempFile) { Remove-Item $TempFile -Force }
+    if ($CleanupTemp -and (Test-Path $TempFile)) { Remove-Item $TempFile -Force }
 }

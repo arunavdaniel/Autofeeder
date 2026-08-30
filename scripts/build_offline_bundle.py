@@ -91,8 +91,25 @@ def copy_playwright_browsers(browsers_dir: Path) -> None:
                 print(f"✔ Bundled browser: {item.name}")
 
 
-def create_bundle(tmp_path: Path, bundle_name: str, target_zip: Path) -> Path:
-    print(f"→ Creating zip archive: {target_zip.name}...")
+def is_wheel_for_platform(filename: str, target_os: str) -> bool:
+    """Return True if wheel filename is compatible with target_os ('macos', 'linux', 'windows', 'universal')."""
+    if target_os == "universal":
+        return True
+    name = filename.lower()
+    # Universal / pure python wheels are compatible with all OSes
+    if "none-any.whl" in name or "-any.whl" in name:
+        return True
+    if target_os == "macos" and ("macosx" in name or "darwin" in name):
+        return True
+    if target_os == "linux" and ("manylinux" in name or "musllinux" in name or "linux" in name):
+        return True
+    if target_os == "windows" and ("win_amd64" in name or "win32" in name or "win" in name):
+        return True
+    return False
+
+
+def create_bundle(tmp_path: Path, target_os: str, target_zip: Path) -> Path:
+    print(f"→ Creating zip archive for {target_os}: {target_zip.name}...")
     if target_zip.exists():
         target_zip.unlink()
 
@@ -100,8 +117,15 @@ def create_bundle(tmp_path: Path, bundle_name: str, target_zip: Path) -> Path:
         for root, _, files in os.walk(tmp_path):
             for f in files:
                 full_path = Path(root) / f
-                arcname = full_path.relative_to(tmp_path)
-                zf.write(full_path, arcname)
+                rel_path = full_path.relative_to(tmp_path)
+
+                # Filter out wheels that belong to a different operating system
+                if "wheels" in rel_path.parts and f.endswith(".whl"):
+                    if not is_wheel_for_platform(f, target_os):
+                        continue
+
+                zf.write(full_path, rel_path)
+
     size_mb = target_zip.stat().st_size / (1024 * 1024)
     print(f"✔ Created {target_zip.name} ({size_mb:.2f} MB)")
     return target_zip
@@ -134,27 +158,15 @@ def main() -> None:
         # Copy source package rss_reader
         shutil.copytree(ROOT_DIR / "rss_reader", tmp_path / "rss_reader")
 
-        # 1. Main universal bundle
-        create_bundle(tmp_path, "universal", dist_dir / "autofeeder-offline-bundle.zip")
-
-        # 2. Platform-specific bundles (filtering wheels by target OS)
-        all_wheels = list(wheels_dir.glob("*.whl"))
-        
-        # Current platform bundle (e.g. macos/linux/windows)
-        sys_name = sys.platform
-        if sys_name == "darwin":
-            platform_name = "macos"
-        elif sys_name == "win32":
-            platform_name = "windows"
-        else:
-            platform_name = "linux"
-
-        target_zip = dist_dir / f"autofeeder-offline-{platform_name}.zip"
-        create_bundle(tmp_path, platform_name, target_zip)
+        # Build platform-specific bundles
+        for platform_name in ("macos", "linux", "windows", "bundle"):
+            os_tag = "universal" if platform_name == "bundle" else platform_name
+            target_zip = dist_dir / f"autofeeder-offline-{platform_name}.zip"
+            create_bundle(tmp_path, os_tag, target_zip)
 
     print("\n==========================================")
     print("✔ Offline bundles created successfully in dist/")
-    for z in dist_dir.glob("autofeeder-offline-*.zip"):
+    for z in sorted(dist_dir.glob("autofeeder-offline-*.zip")):
         print(f"  - {z.name} ({z.stat().st_size / (1024*1024):.2f} MB)")
     print("==========================================\n")
 
