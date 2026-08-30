@@ -1,8 +1,97 @@
 <!doctype html>
 <html lang="en">
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Autofeedly Pipelines</title><link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}"><link rel="stylesheet" href="{{ url_for('static', filename='theme.css') }}"></head>
-<body>
-<header><div><h1>Autofeedly · Pipelines</h1></div><div><a href="/">Overview</a> &nbsp; <a href="/reader">Sources</a> &nbsp; <button class="theme-toggle" aria-label="Toggle dark mode" title="Toggle dark mode">◐</button></div></header>
-<main class="pipeline-page"><section><div class="section-head"><h2>New pipeline</h2><button id="run-preview">Preview</button></div><div class="flow"><div class="flow-card"><b>1. Sources</b><p>Select feeds below</p><div id="feed-options"></div></div><div class="flow-card"><b>2. Browser extraction</b><p>Playwright renders the page, then text, links, and metadata are collected.</p></div><div class="flow-card"><b>3. LLM transform</b><input id="endpoint" value="https://api.openai.com/v1/chat/completions"><input id="model" placeholder="Model"><input id="key" type="password" placeholder="API key"><textarea id="prompt" placeholder="Extract the fields described in the schema."></textarea></div><div class="flow-card"><b>4. JSON schema contract</b><p>The schema is the hard contract for every record. Generate a proposal from the prompt or add fields manually.</p><div id="fields"></div><button id="add-field">+ Add field</button><button id="generate-schema">Generate from prompt</button></div><div class="flow-card"><b>5. Output</b><select id="output-type"><option value="csv">CSV</option><option value="sqlite">SQLite</option></select><input id="output-path" placeholder="Output path (optional)"><input id="table" placeholder="SQLite table name" value="extracted_records"></div><div class="flow-card"><b>6. Automation</b><select id="schedule"><option>Manual only</option><option>Every 15 minutes</option><option>Every hour</option><option>Daily</option></select><label><input id="run-on-change" type="checkbox"> Run extraction engine when this pipeline is saved or changed</label></div></div><button id="save-pipeline" class="primary">Save pipeline</button><span id="pipeline-status"></span></section><aside><h2>Saved pipelines</h2><div id="pipeline-list"></div><h2>Preview result</h2><pre id="preview-result">Run Preview to test one article.</pre></aside></main>
-<script src="{{ url_for('static', filename='theme.js') }}"></script><script src="{{ url_for('static', filename='pipelines.js') }}"></script>
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Autofeeder · Pipeline builder</title><link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}"><link rel="stylesheet" href="{{ url_for('static', filename='theme.css') }}"></head>
+<body class="app-body">
+  <aside class="app-sidebar">
+    <div class="brand"><span class="brand-mark">A</span><div><strong>Autofeeder</strong><small>RSS automation</small></div></div>
+    <nav><a href="/">Overview</a><a class="nav-active" href="/pipelines">Pipelines</a><a href="/runs">Run history</a><a href="/reader">Sources &amp; Reader</a></nav>
+    <div class="sidebar-bottom"><button class="theme-toggle" aria-label="Toggle dark mode" title="Toggle dark mode">◐ <span>Dark mode</span></button><span class="live-dot"></span> Local engine online</div>
+  </aside>
+  <main class="dashboard-main">
+    <header class="page-header"><div><h1>Pipeline builder</h1><p class="lede" id="builder-sub">Build a workflow that turns feed articles into structured records.</p></div><a class="button" href="/pipelines">New</a></header>
+
+    <ol class="stepper" id="stepper">
+      <li data-step="0">Sources</li><li data-step="1">Extract</li><li data-step="2">LLM</li><li data-step="3">Schema</li><li data-step="4">Output</li><li data-step="5">Review</li>
+    </ol>
+
+    <section class="panel" id="wizard">
+      <div class="step" data-step="0">
+        <h2>1 · Choose source</h2>
+        <label class="field-inline">Source type
+          <select id="source-type"><option value="feeds">Live RSS feeds</option><option value="snapshot">Stored snapshot</option></select>
+        </label>
+        <div id="feeds-source">
+          <p class="run-meta">Pick the feeds this pipeline will process. Articles from the selected feeds are fetched, rendered, and extracted.</p>
+          <div id="feed-options" class="feed-options"></div>
+          <label class="field-inline">Max articles per feed <input id="max-articles" type="number" min="1" value="20"></label>
+        </div>
+        <div id="snapshot-source" hidden>
+          <p class="run-meta">Run the pipeline against a captured snapshot instead of fetching live feeds. This is repeatable and works offline.</p>
+          <label class="field-inline">Snapshot <select id="snapshot-id"></select></label>
+          <p class="run-meta">No snapshots yet? Capture one from the <a class="run-link" href="/reader">Sources &amp; Reader</a> page.</p>
+        </div>
+        <h3 style="margin-top:18px">Date range (optional)</h3>
+        <p class="run-meta">Only process articles published inside this window. Leave blank to include everything.</p>
+        <label class="field-inline">From <input id="date-from" type="date"></label>
+        <label class="field-inline">To <input id="date-to" type="date"></label>
+      </div>
+
+      <div class="step" data-step="1" hidden>
+        <h2>2 · Browser extraction</h2>
+        <p class="run-meta">Autofeeder renders each article with Playwright (falls back to HTTP when a browser engine is unavailable) and extracts clean text, links, and metadata.</p>
+        <label class="field-inline"><input id="use-browser" type="checkbox" checked> Use headless browser for JavaScript-heavy pages</label>
+        <p class="run-meta">No extra configuration is required. If Playwright is not installed, the engine automatically falls back to a fast HTTP fetch.</p>
+      </div>
+
+      <div class="step" data-step="2" hidden>
+        <h2>3 · LLM transform</h2>
+        <p class="run-meta">Connect any OpenAI-compatible API. The API key is sent only to your endpoint and is never stored in the database.</p>
+        <label class="field-inline"><input id="llm-enabled" type="checkbox" checked> Enable LLM extraction</label>
+        <label class="field-inline">Endpoint <input id="endpoint" value="https://api.openai.com/v1/chat/completions" placeholder="https://api.openai.com/v1/chat/completions"></label>
+        <label class="field-inline">Model <input id="model" placeholder="gpt-4o-mini"></label>
+        <label class="field-inline">API key <input id="key" type="password" placeholder="sk-… (optional for local models)"></label>
+        <label class="field-block">Prompt
+          <textarea id="prompt" rows="5" placeholder="Extract the fields described in the schema from the article text."></textarea>
+        </label>
+      </div>
+
+      <div class="step" data-step="3" hidden>
+        <h2>4 · JSON schema contract</h2>
+        <p class="run-meta">The schema is the hard contract every record must satisfy. Add fields manually, or let the LLM propose a schema from your prompt.</p>
+        <div id="fields" class="fields"></div>
+        <button class="button" id="add-field">+ Add field</button>
+        <button class="button" id="generate-schema">Suggest from prompt</button>
+      </div>
+
+      <div class="step" data-step="4" hidden>
+        <h2>5 · Output</h2>
+        <p class="run-meta">Validated records are written to a local CSV file or a SQLite database.</p>
+        <label class="field-inline">Type
+          <select id="output-type"><option value="csv">CSV file</option><option value="sqlite">SQLite database</option></select>
+        </label>
+        <label class="field-inline">Path <input id="output-path" placeholder="Leave blank for default location"></label>
+        <label class="field-inline">Table / mode
+          <input id="table" placeholder="extracted_records" value="extracted_records">
+          <select id="output-mode"><option value="append">Append</option><option value="write">Overwrite</option></select>
+        </label>
+      </div>
+
+      <div class="step" data-step="5" hidden>
+        <h2>6 · Review &amp; run</h2>
+        <div id="review" class="review"></div>
+        <label class="field-inline"><input id="run-on-change" type="checkbox"> Run the pipeline immediately after saving</label>
+        <div id="builder-status" class="run-meta"></div>
+      </div>
+
+      <div class="wizard-nav">
+        <button class="button" id="back">Back</button>
+        <button class="button primary" id="next">Next</button>
+        <button class="button primary" id="save" hidden>Save pipeline</button>
+        <button class="button" id="run-now" hidden>Run</button>
+        <button class="button" id="preview-now" hidden>Preview</button>
+      </div>
+    </section>
+  </main>
+  <script src="{{ url_for('static', filename='theme.js') }}"></script>
+  <script src="{{ url_for('static', filename='pipelines.js') }}"></script>
 </body></html>

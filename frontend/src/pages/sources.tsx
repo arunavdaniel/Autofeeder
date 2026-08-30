@@ -165,7 +165,7 @@ function FeedLibrary() {
     try {
       const data = await api.snapshot(id);
       setViewSnapshot(data.articles);
-      setViewSnapshotName(data.snapshot.name);
+      setViewSnapshotName(data.snapshot.name || data.snapshot.source || "");
       setSelectedFeed(null);
       setItems([]);
       setCurrent(null);
@@ -193,6 +193,24 @@ function FeedLibrary() {
         <div className="flex items-center justify-between">
           <h2 className="text-sm font-semibold">Library</h2>
           <div className="flex gap-1">
+            <Button
+              size="sm"
+              variant="outline"
+              className="h-8"
+              onClick={() => {
+                const ids = allFeedIds();
+                if (folderChecks.length === 1 && !feedChecks.length) {
+                  navigate(`/pipelines?folder=${folderChecks[0]}`);
+                } else if (ids.length) {
+                  navigate(`/pipelines?new=1&feeds=${ids.join(",")}`);
+                } else {
+                  navigate("/pipelines?new=1");
+                }
+              }}
+              title="Create pipeline"
+            >
+              <Workflow className="mr-1 h-3.5 w-3.5" /> Pipeline
+            </Button>
             <Button size="icon" variant="ghost" onClick={load} title="Refresh">
               <RefreshCw className="h-4 w-4" />
             </Button>
@@ -255,13 +273,15 @@ function FeedLibrary() {
         <div className="mt-2">
           <h2 className="mb-2 text-sm font-semibold">Snapshots</h2>
           <div className="space-y-2">
-            {snapshots.length === 0 && <p className="text-xs text-muted-foreground">No snapshots yet.</p>}
-            {snapshots.map((s) => (
-              <div key={s.id} className="rounded-lg border p-2">
+            {snapshots.filter((s) => (s.type || s.kind || "feed") === "feed" || s.kind === "pipeline" || s.kind === "article").length === 0 && <p className="text-xs text-muted-foreground">No snapshots yet.</p>}
+            {snapshots
+              .filter((s) => ["feed", "pipeline", "article"].includes(s.type || s.kind || "feed"))
+              .map((s) => (
+              <div key={`${s.type || s.kind}-${s.id}`} className="rounded-lg border p-2">
                 <div className="flex items-center gap-2">
-                  <Badge variant="outline">{s.kind}</Badge>
-                  <span className="flex-1 truncate text-sm font-medium">{s.name}</span>
-                  <Button size="icon" variant="ghost" onClick={() => setRenameSnap({ id: s.id, name: s.name })}>
+                  <Badge variant="outline">{s.kind || s.type || "snapshot"}</Badge>
+                  <span className="flex-1 truncate text-sm font-medium">{s.name || s.source || `Snapshot ${s.id}`}</span>
+                  <Button size="icon" variant="ghost" onClick={() => setRenameSnap({ id: s.id, name: s.name || s.source || "" })}>
                     <Pencil className="h-3.5 w-3.5" />
                   </Button>
                   <Button size="icon" variant="ghost" onClick={() => api.deleteSnapshot(s.id).then(load).catch((e) => toast.error(String(e)))}>

@@ -1,280 +1,384 @@
 import { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { api } from "@/lib/api";
-import type { Dashboard, Pipeline, Snapshot } from "@/lib/types";
+import { SAMPLE_FEEDS } from "@/lib/onboarding";
+import { localLlmReady, configLlmReady } from "@/lib/llm-settings";
+import type { ApiConfig, Dashboard, Pipeline, RunSummary } from "@/lib/types";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { Badge } from "@/components/ui/badge";
+import { Input } from "@/components/ui/input";
 import { Skeleton } from "@/components/ui/skeleton";
-import { Plus, Play, Eye, Pencil, RefreshCw, Activity, Database, Rss, AlertCircle, Brain, Workflow } from "lucide-react";
+import {
+  Plus,
+  Play,
+  Eye,
+  Pencil,
+  RefreshCw,
+  Activity,
+  Database,
+  Rss,
+  AlertCircle,
+  Workflow,
+  ArrowRight,
+  Globe,
+  Clock,
+  Loader2,
+  Zap,
+  Settings,
+  Library,
+} from "lucide-react";
+import { PageShell } from "@/components/page-shell";
+import { StatusBadge } from "@/components/status-badge";
+import { EmptyState } from "@/components/empty-state";
+import { outputLabel, sourceCount } from "@/lib/pipeline-utils";
+import { toast } from "sonner";
 
-function StatusBadge({ status }: { status: string }) {
-  const map: Record<string, string> = {
-    success: "bg-emerald-100 text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-300",
-    failed: "bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-300",
-    running: "bg-blue-100 text-blue-700 dark:bg-blue-900/40 dark:text-blue-300",
-    queued: "bg-muted text-muted-foreground",
-  };
-  return <Badge className={map[status] || "bg-muted"}>{status}</Badge>;
-}
+const QUICK_ACTIONS = [
+  {
+    title: "1. Add a source",
+    description: "Catalog, RSS, website, or API",
+    icon: Library,
+    to: "/discover",
+  },
+  {
+    title: "2. New pipeline",
+    description: "Fetch → extract → DuckDB",
+    icon: Workflow,
+    to: "/pipelines",
+    action: "new",
+  },
+  {
+    title: "3. Run history",
+    description: "Logs, rows, failures",
+    icon: Activity,
+    to: "/runs",
+  },
+  {
+    title: "4. Publish",
+    description: "Files, RSS/JSON, upsert",
+    icon: Database,
+    to: "/exports",
+  },
+];
 
 export function Overview() {
   const navigate = useNavigate();
   const [dash, setDash] = useState<Dashboard | null>(null);
   const [pipelines, setPipelines] = useState<Pipeline[]>([]);
-  const [snapshots, setSnapshots] = useState<Snapshot[]>([]);
+  const [recentRuns, setRecentRuns] = useState<RunSummary[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [feedUrl, setFeedUrl] = useState("");
+  const [addingFeed, setAddingFeed] = useState(false);
+  const [apiConfigs, setApiConfigs] = useState<ApiConfig[]>([]);
+
+  const refresh = async () => {
+    try {
+      const [d, p, runs, configs] = await Promise.all([
+        api.dashboard(),
+        api.pipelines(),
+        api.runsFiltered({ limit: 6 }),
+        api.apiConfigs().catch(() => [] as ApiConfig[]),
+      ]);
+      setDash(d);
+      setPipelines(p);
+      setRecentRuns(Array.isArray(runs?.runs) ? runs.runs : []);
+      setApiConfigs(Array.isArray(configs) ? configs : []);
+    } catch (e) {
+      toast.error(String(e));
+    } finally {
+      setLoading(false);
+    }
+  };
 
   useEffect(() => {
-    api.dashboard().then(setDash).catch(() => {});
-    api.pipelines().then(setPipelines).catch(() => {});
-    api.snapshots().then(setSnapshots).catch(() => {});
+    refresh();
   }, []);
 
   const run = (id: number, preview: boolean) =>
-    api.runPipeline(id, preview).then((r) => navigate(`/runs?id=${r.run_id}`)).catch(() => {});
+    api
+      .runPipeline(id, preview)
+      .then((r) => navigate(`/runs?id=${r.run_id}`))
+      .catch((e) => toast.error(String(e)));
 
-  const refresh = () => {
-    api.dashboard().then(setDash).catch(() => {});
-    api.pipelines().then(setPipelines).catch(() => {});
-    api.snapshots().then(setSnapshots).catch(() => {});
+  const addFeed = async (url?: string) => {
+    const target = (url ?? feedUrl).trim();
+    if (!target) return toast.error("Enter a feed URL");
+    setAddingFeed(true);
+    try {
+      let folders = await api.folders();
+      let folder = folders[0];
+      if (!folder) {
+        const created = await api.addFolder("Feeds");
+        folder = { id: created.id, name: created.name, feeds: [], saved_count: 0 };
+      }
+      const feed = await api.addFeed(target, folder.id);
+      toast.success(`Added ${feed.title}`, {
+        action: {
+          label: "Create pipeline",
+          onClick: () => navigate(`/pipelines?folder=${folder.id}`),
+        },
+      });
+      setFeedUrl("");
+      refresh();
+    } catch (e) {
+      toast.error(String(e));
+    } finally {
+      setAddingFeed(false);
+    }
   };
 
+  const llmReady = localLlmReady() || apiConfigs.some(configLlmReady);
   const stats = [
-    { label: "Active pipelines", value: dash?.active_pipelines, sub: `${dash?.pipelines ?? 0} total`, icon: Activity, borderClass: "border-l-4 border-l-emerald-500" },
-    { label: "Feeds connected", value: dash?.feeds, sub: `${dash?.saved_articles ?? 0} saved articles`, icon: Rss, borderClass: "border-l-4 border-l-blue-500" },
-    { label: "Records written", value: dash?.total_records, sub: `${dash?.total_runs ?? 0} runs`, icon: Database, borderClass: "border-l-4 border-l-violet-500" },
-    { label: "Failed records", value: dash?.total_errors, sub: `${dash?.active_runs ?? 0} in progress`, icon: AlertCircle, borderClass: "border-l-4 border-l-amber-500" },
+    { label: "Pipelines", value: dash?.pipelines, sub: `${dash?.active_pipelines ?? 0} active`, icon: Activity },
+    { label: "Feeds", value: dash?.feeds, sub: `${dash?.saved_articles ?? 0} articles saved`, icon: Rss },
+    { label: "Records", value: dash?.total_records, sub: `${dash?.total_runs ?? 0} total runs`, icon: Database },
+    { label: "Errors", value: dash?.total_errors, sub: `${dash?.active_runs ?? 0} running now`, icon: AlertCircle },
   ];
+  const scheduled = pipelines.filter((p) => p.definition.schedule?.enabled || p.definition.snapshot?.enabled);
+  const showAddFeed = !loading && (dash?.feeds ?? 0) === 0 && pipelines.length === 0;
 
   return (
-    <div className="mx-auto max-w-6xl space-y-6 p-8">
-      <div className="flex items-center justify-between">
-        <div>
-          <h1 className="text-2xl font-semibold tracking-tight">Overview</h1>
-          <p className="text-sm text-muted-foreground">
-            Turn feeds, webpages, and APIs into structured records on your local machine.
-          </p>
-        </div>
-        <div className="flex items-center gap-2">
-          <Button variant="outline" size="sm" onClick={refresh} title="Refresh">
-            <RefreshCw className="h-4 w-4" />
+    <PageShell
+      title="Overview"
+      description="Add a source, create a pipeline, run it, then publish from DuckDB."
+      actions={
+        <>
+          <Button variant="outline" size="sm" onClick={refresh} disabled={loading}>
+            <RefreshCw className={`h-4 w-4 ${loading ? "animate-spin" : ""}`} />
           </Button>
-          <Button onClick={() => navigate("/pipelines")}>
-            <Plus className="mr-1 h-4 w-4" /> New pipeline
+          <Button size="sm" onClick={() => navigate("/pipelines?new=1")}>
+            <Plus className="mr-1.5 h-4 w-4" /> New pipeline
           </Button>
-        </div>
-      </div>
-
-      <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
-        {stats.map((s) => (
-          <Card key={s.label} className={`relative overflow-hidden transition-all hover:shadow-sm ${s.borderClass}`}>
-            <CardHeader className="flex flex-row items-center justify-between pb-2 space-y-0">
-              <CardTitle className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
-                {s.label}
-              </CardTitle>
-              <s.icon className="h-4 w-4 text-muted-foreground/60" />
-            </CardHeader>
-            <CardContent>
-              {dash ? (
-                <>
-                  <div className="text-3xl font-bold tracking-tight tabular-nums">{s.value ?? 0}</div>
-                  <div className="text-xs text-muted-foreground mt-1">{s.sub}</div>
-                </>
-              ) : (
-                <Skeleton className="h-9 w-16" />
-              )}
-            </CardContent>
-          </Card>
+        </>
+      }
+    >
+      {/* Quick actions */}
+      <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+        {QUICK_ACTIONS.map((action) => (
+          <button
+            key={action.title}
+            type="button"
+            className="action-tile"
+            onClick={() => {
+              if (action.action === "new") {
+                navigate("/pipelines?new=1");
+              } else {
+                navigate(action.to);
+              }
+            }}
+          >
+            <div className="mb-4 inline-flex rounded-xl border border-border/80 bg-muted/40 p-2.5">
+              <action.icon className="h-5 w-5" strokeWidth={1.5} />
+            </div>
+            <div className="text-[15px] font-semibold tracking-tight">{action.title}</div>
+            <p className="mt-1 text-sm text-muted-foreground">{action.description}</p>
+            <span className="mt-4 inline-flex items-center text-xs font-medium text-muted-foreground transition-colors group-hover:text-foreground">
+              Open <ArrowRight className="ml-1 h-3 w-3" />
+            </span>
+          </button>
         ))}
       </div>
 
-      <div className="space-y-3">
-        <h2 className="text-sm font-semibold uppercase tracking-wider text-muted-foreground/80">Product Workflow Guide</h2>
-        <div className="grid gap-4 md:grid-cols-4">
-          <Card className="bg-card hover:bg-accent/20 transition-all flex flex-col justify-between border-t-2 border-t-emerald-500">
-            <CardHeader className="pb-2">
-              <div className="flex items-center gap-2 text-sm font-semibold text-emerald-500">
-                <Rss className="h-4 w-4" />
-                <span>1. Connect Sources</span>
-              </div>
-              <p className="text-xs text-muted-foreground mt-1">
-                Add RSS feeds or monitor website URLs for content changes.
+      {showAddFeed && (
+        <div className="glass-panel p-6 sm:p-8">
+          <div className="mx-auto max-w-xl space-y-5 text-center">
+            <div className="mx-auto grid h-12 w-12 place-items-center rounded-2xl border bg-background">
+              <Zap className="h-5 w-5" />
+            </div>
+            <div>
+              <h2 className="text-xl font-semibold tracking-tight">Start with a source</h2>
+              <p className="mt-1.5 text-sm text-muted-foreground">
+                Paste an RSS URL, or open Discover. Next you will create a pipeline that writes DuckDB and can publish.
               </p>
-            </CardHeader>
-            <CardContent className="pt-0 mt-auto">
-              <Button variant="link" className="p-0 h-auto text-xs text-emerald-500 hover:underline font-medium" onClick={() => navigate("/sources")}>
-                Configure Sources →
+            </div>
+            <div className="flex flex-col gap-2 sm:flex-row">
+              <Input
+                value={feedUrl}
+                onChange={(e) => setFeedUrl(e.target.value)}
+                placeholder="https://example.com/feed.xml"
+                className="h-11 rounded-xl bg-background"
+                onKeyDown={(e) => e.key === "Enter" && addFeed()}
+              />
+              <Button className="h-11 shrink-0 rounded-xl px-6" onClick={() => addFeed()} disabled={addingFeed}>
+                {addingFeed ? <Loader2 className="h-4 w-4 animate-spin" /> : "Add feed"}
               </Button>
-            </CardContent>
-          </Card>
-
-          <Card className="bg-card hover:bg-accent/20 transition-all flex flex-col justify-between border-t-2 border-t-blue-500">
-            <CardHeader className="pb-2">
-              <div className="flex items-center gap-2 text-sm font-semibold text-blue-500">
-                <Brain className="h-4 w-4" />
-                <span>2. Setup AI / API</span>
-              </div>
-              <p className="text-xs text-muted-foreground mt-1">
-                Configure LLM endpoints (OpenAI, Ollama) and prompt templates.
-              </p>
-            </CardHeader>
-            <CardContent className="pt-0 mt-auto">
-              <Button variant="link" className="p-0 h-auto text-xs text-blue-500 hover:underline font-medium" onClick={() => navigate("/settings")}>
-                Configure Keys/Prompts →
-              </Button>
-            </CardContent>
-          </Card>
-
-          <Card className="bg-card hover:bg-accent/20 transition-all flex flex-col justify-between border-t-2 border-t-violet-500">
-            <CardHeader className="pb-2">
-              <div className="flex items-center gap-2 text-sm font-semibold text-violet-500">
-                <Workflow className="h-4 w-4" />
-                <span>3. Build Pipeline</span>
-              </div>
-              <p className="text-xs text-muted-foreground mt-1">
-                Design automated workflows to map extracted data fields to schemas.
-              </p>
-            </CardHeader>
-            <CardContent className="pt-0 mt-auto">
-              <Button variant="link" className="p-0 h-auto text-xs text-violet-500 hover:underline font-medium" onClick={() => navigate("/pipelines")}>
-                Create Pipeline →
-              </Button>
-            </CardContent>
-          </Card>
-
-          <Card className="bg-card hover:bg-accent/20 transition-all flex flex-col justify-between border-t-2 border-t-amber-500">
-            <CardHeader className="pb-2">
-              <div className="flex items-center gap-2 text-sm font-semibold text-amber-500">
-                <Database className="h-4 w-4" />
-                <span>4. Query DuckDB</span>
-              </div>
-              <p className="text-xs text-muted-foreground mt-1">
-                Browse your local data tables, run SQL, or run semantic vector searches.
-              </p>
-            </CardHeader>
-            <CardContent className="pt-0 mt-auto">
-              <Button variant="link" className="p-0 h-auto text-xs text-amber-500 hover:underline font-medium" onClick={() => navigate("/duckdb")}>
-                View Local Data →
-              </Button>
-            </CardContent>
-          </Card>
+            </div>
+            <div className="flex flex-wrap justify-center gap-2">
+              {SAMPLE_FEEDS.map((sample) => (
+                <button
+                  key={sample.url}
+                  type="button"
+                  className="rounded-full border border-border/80 bg-background px-3.5 py-1.5 text-xs font-medium text-muted-foreground transition-colors hover:border-foreground/30 hover:text-foreground"
+                  onClick={() => addFeed(sample.url)}
+                  disabled={addingFeed}
+                >
+                  {sample.label}
+                </button>
+              ))}
+              <button
+                type="button"
+                className="rounded-full border border-foreground/20 bg-foreground px-3.5 py-1.5 text-xs font-medium text-background transition-opacity hover:opacity-90"
+                onClick={() => navigate("/discover")}
+              >
+                Browse catalog
+              </button>
+            </div>
+          </div>
         </div>
+      )}
+
+      {/* Stats */}
+      <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
+        {stats.map((s) => (
+          <div key={s.label} className="stat-card">
+            <div className="flex items-center justify-between">
+              <span className="text-xs font-medium uppercase tracking-wider text-muted-foreground">{s.label}</span>
+              <s.icon className="h-4 w-4 text-muted-foreground/60" strokeWidth={1.5} />
+            </div>
+            {dash ? (
+              <>
+                <div className="mt-3 text-3xl font-semibold tabular-nums tracking-tight">{s.value ?? 0}</div>
+                <div className="mt-1 text-xs text-muted-foreground">{s.sub}</div>
+              </>
+            ) : (
+              <Skeleton className="mt-3 h-9 w-16" />
+            )}
+          </div>
+        ))}
       </div>
 
-      <div className="grid gap-4 lg:grid-cols-3">
-        <Card className="lg:col-span-2">
-          <CardHeader className="flex-row items-center justify-between">
-            <CardTitle>Your pipelines</CardTitle>
+      {!llmReady && !loading && (
+        <Card className="border-dashed bg-muted/10">
+          <CardContent className="flex flex-col items-start gap-3 py-5 sm:flex-row sm:items-center sm:justify-between">
+            <div className="flex items-start gap-3">
+              <div className="rounded-xl border bg-background p-2">
+                <Settings className="h-4 w-4" />
+              </div>
+              <div>
+                <div className="font-medium">LLM not configured</div>
+                <p className="text-sm text-muted-foreground">Pipelines that extract with an LLM need an endpoint and model. Set them before you run.</p>
+              </div>
+            </div>
+            <Button variant="outline" onClick={() => navigate("/settings")}>
+              Open settings
+            </Button>
+          </CardContent>
+        </Card>
+      )}
+
+      <div className="grid gap-6 lg:grid-cols-5">
+        <Card className="lg:col-span-3">
+          <CardHeader className="flex-row items-center justify-between pb-4">
+            <CardTitle>Pipelines</CardTitle>
             <Button variant="ghost" size="sm" onClick={() => navigate("/pipelines")}>
-              Manage
+              View all
             </Button>
           </CardHeader>
           <CardContent className="space-y-2">
             {pipelines.length === 0 && (
-              <p className="text-sm text-muted-foreground">No pipelines yet.</p>
+              <EmptyState
+                icon={Workflow}
+                title="No pipelines yet"
+                description="A pipeline is the product: pick sources, extract, write DuckDB, optionally publish."
+                actionLabel="New pipeline"
+                onAction={() => navigate("/pipelines?new=1")}
+                secondaryLabel="Add a source"
+                onSecondary={() => navigate("/discover")}
+              />
             )}
-            {pipelines.map((p) => (
+            {pipelines.slice(0, 5).map((p) => (
               <div
                 key={p.id}
-                className="flex items-center gap-3 rounded-lg border p-3"
+                className="flex flex-col gap-3 rounded-xl border border-border/60 bg-muted/15 p-4 transition-colors hover:bg-muted/30 sm:flex-row sm:items-center"
               >
                 <div className="min-w-0 flex-1">
                   <div className="truncate font-medium">{p.name}</div>
                   <div className="text-xs text-muted-foreground">
-                    {(p.definition.feed_ids?.length ?? 0)} sources ·{" "}
-                    DuckDB output
+                    {sourceCount(p.definition)} sources · {outputLabel(p.definition)}
                   </div>
                 </div>
-                <Button size="sm" variant="outline" onClick={() => run(p.id, false)}>
-                  <Play className="mr-1 h-3.5 w-3.5" /> Run
-                </Button>
-                <Button size="sm" variant="outline" onClick={() => run(p.id, true)}>
-                  <Eye className="mr-1 h-3.5 w-3.5" /> Preview
-                </Button>
-                <Button size="sm" variant="ghost" onClick={() => navigate(`/pipelines?id=${p.id}`)}>
-                  <Pencil className="h-3.5 w-3.5" />
-                </Button>
+                <div className="flex flex-wrap gap-2">
+                  <Button size="sm" className="rounded-lg" onClick={() => run(p.id, false)}>
+                    <Play className="mr-1 h-3.5 w-3.5" /> Run
+                  </Button>
+                  <Button size="sm" variant="outline" className="rounded-lg" onClick={() => run(p.id, true)}>
+                    <Eye className="mr-1 h-3.5 w-3.5" /> Preview
+                  </Button>
+                  <Button size="sm" variant="ghost" className="rounded-lg" onClick={() => navigate(`/pipelines?edit=${p.id}`)}>
+                    <Pencil className="h-3.5 w-3.5" />
+                  </Button>
+                </div>
               </div>
             ))}
           </CardContent>
         </Card>
 
-        <Card>
-          <CardHeader className="flex-row items-center justify-between">
+        <Card className="lg:col-span-2">
+          <CardHeader className="flex-row items-center justify-between pb-4">
             <CardTitle>Recent runs</CardTitle>
             <Button variant="ghost" size="sm" onClick={() => navigate("/runs")}>
               View all
             </Button>
           </CardHeader>
           <CardContent className="space-y-2">
-            {!dash?.last_run && <p className="text-sm text-muted-foreground">No runs yet.</p>}
-            {dash?.last_run && (
-              <div
-                className="flex cursor-pointer items-center gap-3 rounded-lg border p-3"
-                onClick={() => navigate(`/runs?id=${dash.last_run!.id}`)}
+            {recentRuns.length === 0 && (
+              <EmptyState
+                icon={Activity}
+                title="No runs yet"
+                description="Run a pipeline from the list. This is where you inspect rows and failures."
+                actionLabel="New pipeline"
+                onAction={() => navigate("/pipelines?new=1")}
+              />
+            )}
+            {recentRuns.map((r) => (
+              <button
+                key={r.id}
+                type="button"
+                onClick={() => navigate(`/runs?id=${r.id}`)}
+                className="flex w-full items-center gap-3 rounded-xl border border-border/60 px-3 py-3 text-left transition-colors hover:bg-muted/30"
               >
-                <StatusBadge status={dash.last_run.status} />
+                <StatusBadge status={r.status} />
                 <div className="min-w-0 flex-1">
+                  <div className="truncate text-sm font-medium">
+                    {r.pipeline_name || `Pipeline #${r.pipeline_id}`}
+                  </div>
                   <div className="text-xs text-muted-foreground">
-                    #{dash.last_run.id} · {dash.last_run.records_count} records ·{" "}
-                    {dash.last_run.error_count} errors
+                    {r.records_count} records · {r.error_count} errors
                   </div>
                 </div>
-              </div>
-            )}
-            {snapshots.slice(0, 3).map((s) => (
-              <div key={s.id} className="flex items-center gap-2 text-sm">
-                <Badge variant="outline">{s.kind}</Badge>
-                <span className="truncate">{s.name}</span>
-                <span className="ml-auto text-xs text-muted-foreground">{s.article_count}</span>
-              </div>
+              </button>
             ))}
           </CardContent>
         </Card>
       </div>
 
-      <Card>
-        <CardHeader className="flex-row items-center justify-between">
-          <CardTitle>Schedules</CardTitle>
-          <Button variant="ghost" size="sm" onClick={() => navigate("/pipelines")}>
-            Manage
-          </Button>
-        </CardHeader>
-        <CardContent className="space-y-2">
-          {pipelines.filter((p) => p.definition.schedule?.enabled).length === 0 && (
-            <p className="text-sm text-muted-foreground">
-              No scheduled pipelines. Enable scheduling in a pipeline&apos;s Review step.
-            </p>
-          )}
-          {pipelines
-            .filter((p) => p.definition.schedule?.enabled)
-            .map((p) => {
-              const s = p.definition.schedule!;
-              const label =
-                s.kind === "daily"
-                  ? `Daily at ${s.time || "09:00"}`
-                  : `Every ${s.minutes || 60} min`;
+      {scheduled.length > 0 && (
+        <Card>
+          <CardHeader className="flex-row items-center justify-between">
+            <CardTitle className="flex items-center gap-2 text-base">
+              <Clock className="h-4 w-4 text-muted-foreground" />
+              Scheduled
+            </CardTitle>
+            <Button variant="ghost" size="sm" onClick={() => navigate("/pipelines")}>
+              Manage
+            </Button>
+          </CardHeader>
+          <CardContent className="grid gap-2 sm:grid-cols-2">
+            {scheduled.map((p) => {
+              const s = p.definition.schedule?.enabled ? p.definition.schedule : p.definition.snapshot;
+              const kind = s?.kind === "daily" ? `Daily at ${s.time || "09:00"}` : `Every ${s?.minutes || 60} min`;
+              const label = p.definition.snapshot?.enabled && !p.definition.schedule?.enabled ? `Snapshots · ${kind}` : kind;
               return (
-                <div
-                  key={p.id}
-                  className="flex items-center gap-3 rounded-lg border p-3"
-                >
-                  <Badge className="bg-blue-100 text-blue-700 dark:bg-blue-900/40 dark:text-blue-300">
-                    {label}
-                  </Badge>
+                <div key={p.id} className="flex items-center gap-3 rounded-xl border border-border/60 px-4 py-3">
+                  <Globe className="h-4 w-4 shrink-0 text-muted-foreground" />
                   <div className="min-w-0 flex-1 truncate font-medium">{p.name}</div>
-                  <Button
-                    size="sm"
-                    variant="ghost"
-                    onClick={() => navigate(`/pipelines?id=${p.id}`)}
-                  >
-                    <Pencil className="h-3.5 w-3.5" />
-                  </Button>
+                  <span className="text-xs text-muted-foreground">{label}</span>
                 </div>
               );
             })}
-        </CardContent>
-      </Card>
-    </div>
+          </CardContent>
+        </Card>
+      )}
+    </PageShell>
   );
 }

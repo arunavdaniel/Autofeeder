@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Autofeeder · Run history</title><link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}"><link rel="stylesheet" href="{{ url_for('static', filename='theme.css') }}"></head>
+<body class="app-body">
+  <aside class="app-sidebar">
+    <div class="brand"><span class="brand-mark">A</span><div><strong>Autofeeder</strong><small>RSS automation</small></div></div>
+    <nav><a href="/">Overview</a><a href="/pipelines">Pipelines</a><a class="nav-active" href="/runs">Run history</a><a href="/reader">Sources &amp; Reader</a></nav>
+    <div class="sidebar-bottom"><button class="theme-toggle" aria-label="Toggle dark mode" title="Toggle dark mode">◐ <span>Dark mode</span></button><span class="live-dot"></span> Local engine online</div>
+  </aside>
+  <main class="dashboard-main">
+    <header class="page-header"><div><h1>Run history</h1><p class="lede">Every pipeline execution, with live logs and extracted results.</p></div><a class="button" href="/pipelines">+ New pipeline</a></header>
+    <section class="dashboard-grid">
+      <div class="panel"><div class="panel-heading"><h2>Runs</h2><button class="button" id="refresh">Refresh</button></div><div id="run-list" class="run-list"><div class="empty-state"><p>No runs yet.</p></div></div></div>
+      <div class="panel" id="detail-panel">
+        <div class="panel-heading"><h2 id="detail-title">Run details</h2><span id="detail-status"></span></div>
+        <div id="detail-body"><div class="empty-state"><p>Select a run to see progress, logs, and extracted records.</p></div></div>
+      </div>
+    </section>
+  </main>
+  <div class="status-bar idle" id="status-bar">
+    <span class="sb-spin"></span><span class="sb-phase" id="sb-phase">idle</span>
+    <span class="sb-msg" id="sb-msg">Engine is ready</span>
+    <span class="sb-progress"><span class="sb-track"><span class="sb-fill" id="sb-fill"></span></span><span id="sb-count"></span></span>
+    <span class="sb-time" id="sb-time"></span>
+  </div>
+  <script src="{{ url_for('static', filename='theme.js') }}"></script>
+  <script src="{{ url_for('static', filename='runs.js') }}"></script>
+</body></html>

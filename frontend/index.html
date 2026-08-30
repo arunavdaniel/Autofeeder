@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" class="theme">
   <head>
     <meta charset="UTF-8" />
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
@@ -7,10 +7,12 @@
     <title>Autofeeder</title>
     <script>
       const theme = localStorage.getItem('autofeeder-theme') || localStorage.getItem('autofeedly-theme');
-      if (theme === 'dark' || (!theme && matchMedia('(prefers-color-scheme: dark)').matches)) {
+      const dark = theme === 'dark' || theme === 'black' || ((theme === 'system' || !theme) && matchMedia('(prefers-color-scheme: dark)').matches);
+      if (dark) {
         document.documentElement.classList.add('dark');
         document.documentElement.style.colorScheme = 'dark';
       }
+      if (theme === 'black') document.documentElement.classList.add('theme-black');
     </script>
   </head>
   <body>

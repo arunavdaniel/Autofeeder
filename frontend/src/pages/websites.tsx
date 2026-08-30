@@ -1,11 +1,16 @@
 import { useEffect, useRef, useState } from "react";
+import { Link, useNavigate } from "react-router-dom";
 import { api } from "@/lib/api";
 import type { Website, WebsiteChange, SchemaDef } from "@/lib/types";
+import { PageShell } from "@/components/page-shell";
+import { EmptyState } from "@/components/empty-state";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
+import { Badge } from "@/components/ui/badge";
 import {
   Plus,
   RefreshCw,
@@ -19,10 +24,13 @@ import {
   Table2,
   Save,
   ExternalLink,
+  FlaskConical,
 } from "lucide-react";
 import { toast } from "sonner";
+import { setStatus, clearStatus } from "@/lib/status";
 
 export function Websites() {
+  const navigate = useNavigate();
   const [items, setItems] = useState<Website[]>([]);
   const [schemas, setSchemas] = useState<SchemaDef[]>([]);
   const [changes, setChanges] = useState<WebsiteChange[]>([]);
@@ -46,6 +54,7 @@ export function Websites() {
     schema_id: "",
     prompt: "",
     respect_robots: true,
+    ignore_selectors: "",
     browser: {
       viewport_width: 1440,
       viewport_height: 900,
@@ -57,6 +66,9 @@ export function Websites() {
     },
   });
   const [busy, setBusy] = useState<number | null>(null);
+  const [testBusy, setTestBusy] = useState(false);
+  const [testResult, setTestResult] = useState<Record<string, unknown> | null>(null);
+  const [tab, setTab] = useState("monitors");
   const [viewer, setViewer] = useState<Website | null>(null);
   const [preview, setPreview] = useState<Record<string, any> | null>(null);
   const [selector, setSelector] = useState("");
@@ -75,6 +87,8 @@ export function Websites() {
         ),
       );
       setSnapshotCounts(Object.fromEntries(counts));
+      const pending = await api.allWebsiteChanges("pending").catch(() => [] as WebsiteChange[]);
+      setChanges(pending);
     } catch (e) {
       toast.error(String(e));
     }
@@ -87,9 +101,52 @@ export function Websites() {
     load();
     api
       .fetchBackends()
-      .then(setBackends)
+      .then((items) => {
+        setBackends(items);
+        const preferred = items.find((b) => b.id === "playwright-chromium" && b.available);
+        if (preferred) {
+          setForm((current) =>
+            current.fetch_method === "http" ? { ...current, fetch_method: preferred.id } : current,
+          );
+        }
+      })
       .catch(() => {});
   }, []);
+  const buildFetchOptions = () => {
+    const ignore = form.ignore_selectors
+      .split(",")
+      .map((item) => item.trim())
+      .filter(Boolean);
+    return {
+      respect_robots: form.respect_robots,
+      ignore_selectors: ignore,
+      viewport_width: Number(form.browser.viewport_width) || 1440,
+      viewport_height: Number(form.browser.viewport_height) || 900,
+      locale: form.browser.locale || "en-US",
+      timezone: form.browser.timezone || "UTC",
+      user_agent: form.browser.user_agent,
+      wait_until: form.browser.wait_until || "domcontentloaded",
+      extra_wait_ms: Number(form.browser.extra_wait_ms) || 0,
+    };
+  };
+  const testFetch = async () => {
+    if (!form.url.trim()) return toast.error("URL is required");
+    setTestBusy(true);
+    setTestResult(null);
+    try {
+      const result = await api.testWebsiteFetch({
+        url: form.url,
+        fetch_method: form.fetch_method,
+        fetch_options: buildFetchOptions(),
+      });
+      setTestResult(result);
+      toast.success(`Fetched ${result.text_length ?? 0} chars in ${result.duration_ms ?? "?"}ms`);
+    } catch (e) {
+      toast.error(String(e));
+    } finally {
+      setTestBusy(false);
+    }
+  };
   const add = async () => {
     if (!form.url.trim()) return toast.error("URL is required");
     try {
@@ -97,18 +154,10 @@ export function Websites() {
         ...form,
         name: form.name || form.url,
         schema_id: form.schema_id ? Number(form.schema_id) : null,
-        fetch_options: {
-          respect_robots: form.respect_robots,
-          viewport_width: Number(form.browser.viewport_width) || 1440,
-          viewport_height: Number(form.browser.viewport_height) || 900,
-          locale: form.browser.locale || "en-US",
-          timezone: form.browser.timezone || "UTC",
-          user_agent: form.browser.user_agent,
-          wait_until: form.browser.wait_until || "domcontentloaded",
-          extra_wait_ms: Number(form.browser.extra_wait_ms) || 0,
-        },
+        fetch_options: buildFetchOptions(),
       });
-      setForm({ ...form, name: "", url: "" });
+      setForm({ ...form, name: "", url: "", ignore_selectors: "" });
+      setTestResult(null);
       load();
     } catch (e) {
       toast.error(String(e));
@@ -116,17 +165,20 @@ export function Websites() {
   };
   const check = async (id: number) => {
     setBusy(id);
+    const site = items.find((x) => x.id === id);
+    const name = site ? site.name : "website";
+    setStatus({ label: `Checking website "${name}"…`, indeterminate: true });
     try {
       const result = await api.checkWebsite(id);
       toast.success(
         result.changed ? "Meaningful change detected" : "No meaningful change",
       );
       load();
-      if (result.changed) api.websiteChanges(id).then(setChanges);
     } catch (e) {
       toast.error(String(e));
     } finally {
       setBusy(null);
+      clearStatus();
     }
   };
   const refreshChanges = (id: number) =>
@@ -135,12 +187,15 @@ export function Websites() {
       .then(setChanges)
       .catch((e) => toast.error(String(e)));
   const openSession = async (site: Website) => {
+    setStatus({ label: `Opening interactive browser session for "${site.name}"…`, indeterminate: true });
     try {
       toast.info("A visible browser will open. Interact manually, then close it to save the session.");
       await api.openWebsiteSession(site.id);
       toast.success("Browser opened. Close it when finished to save the session locally.");
     } catch (e) {
       toast.error(String(e));
+    } finally {
+      clearStatus();
     }
   };
   const makeSelector = (element: Element) => {
@@ -175,7 +230,7 @@ export function Websites() {
       if (!document) return;
       const style = document.createElement("style");
       style.textContent =
-        ".autofeeder-hover { outline: 3px solid #14b8a6 !important; cursor: crosshair !important; }";
+        ".autofeeder-hover { outline: 3px solid #525252 !important; cursor: crosshair !important; }";
       document.head?.appendChild(style);
       const over = (event: Event) => {
         event.preventDefault();
@@ -284,15 +339,37 @@ export function Websites() {
       toast.error(String(e));
     }
   };
+  const pendingCount = changes.filter((c) => c.status === "pending").length;
+  const siteName = (id: number) => items.find((s) => s.id === id)?.name || `Site #${id}`;
+
   return (
-    <div className="mx-auto max-w-5xl space-y-6 p-8">
-      <div>
-        <h1 className="text-2xl font-semibold tracking-tight">Websites</h1>
-        <p className="text-sm text-muted-foreground">
-          Monitor public pages, keep local snapshots, and extract only
-          meaningful changes.
-        </p>
-      </div>
+    <PageShell
+      title="Websites"
+      description="Monitor public pages, keep local snapshots, and extract only meaningful changes."
+      width="6xl"
+      actions={
+        <Link
+          to="/pipelines?new=1"
+          className="inline-flex h-8 items-center justify-center rounded-md border border-input bg-background px-3 text-xs font-medium hover:bg-accent"
+        >
+          New pipeline
+        </Link>
+      }
+    >
+      <Tabs value={tab} onValueChange={setTab}>
+        <TabsList>
+          <TabsTrigger value="monitors">Monitors</TabsTrigger>
+          <TabsTrigger value="changes">
+            Pending changes
+            {pendingCount > 0 && (
+              <Badge variant="secondary" className="ml-2">
+                {pendingCount}
+              </Badge>
+            )}
+          </TabsTrigger>
+        </TabsList>
+
+        <TabsContent value="monitors" className="space-y-6">
       <Card>
         <CardHeader>
           <CardTitle className="text-base">Add website source</CardTitle>
@@ -506,23 +583,68 @@ export function Websites() {
               </div>
             </div>
           </details>
-          <Button onClick={add} className="md:col-span-3">
-            <Plus className="mr-1 h-4 w-4" /> Add website
-          </Button>
+          <div className="space-y-1 md:col-span-3">
+            <Label>Ignore selectors</Label>
+            <Input
+              value={form.ignore_selectors}
+              onChange={(e) => setForm({ ...form, ignore_selectors: e.target.value })}
+              placeholder=".cookie-banner, #comments, .sidebar"
+            />
+            <p className="text-xs text-muted-foreground">
+              Comma-separated CSS selectors stripped before change detection.
+            </p>
+          </div>
+          <div className="flex flex-wrap items-center gap-2 md:col-span-3">
+            <Button variant="outline" onClick={testFetch} disabled={testBusy || !form.url.trim()}>
+              {testBusy ? <Loader2 className="mr-1 h-4 w-4 animate-spin" /> : <FlaskConical className="mr-1 h-4 w-4" />}
+              Test fetch
+            </Button>
+            <Button onClick={add}>
+              <Plus className="mr-1 h-4 w-4" /> Add website
+            </Button>
+          </div>
+          {testResult && (
+            <div className="md:col-span-3 rounded-md border bg-muted/30 p-3 text-xs">
+              <div className="mb-2 font-medium">Test result</div>
+              <div className="grid gap-1 text-muted-foreground sm:grid-cols-2">
+                <span>Backend: {String(testResult.backend || form.fetch_method)}</span>
+                <span>Status: {String(testResult.status_code ?? "—")}</span>
+                <span>Duration: {String(testResult.duration_ms ?? "—")} ms</span>
+                <span>Text length: {String(testResult.text_length ?? 0)} chars</span>
+              </div>
+              {typeof testResult.text === "string" && testResult.text && (
+                <pre className="mt-2 max-h-32 overflow-auto whitespace-pre-wrap rounded border bg-background p-2 text-foreground">
+                  {testResult.text.slice(0, 1200)}
+                  {testResult.text.length > 1200 ? "…" : ""}
+                </pre>
+              )}
+            </div>
+          )}
         </CardContent>
       </Card>
       <div className="space-y-3">
         {items.length === 0 && (
-          <p className="text-sm text-muted-foreground">
-            No website monitors yet.
-          </p>
+          <EmptyState
+            icon={Globe}
+            title="No website monitors yet"
+            description="Add a URL, or install from Discover. Then put the monitor on a pipeline."
+            actionLabel="Discover websites"
+            onAction={() => navigate("/discover")}
+            secondaryLabel="New pipeline"
+            onSecondary={() => navigate("/pipelines?new=1")}
+          />
         )}
         {items.map((site) => (
           <Card key={site.id}>
             <CardContent className="flex items-center gap-3 p-4">
               <Globe className="h-5 w-5 text-muted-foreground" />
               <div className="min-w-0 flex-1">
-                <div className="font-medium">{site.name}</div>
+                <div className="flex items-center gap-2">
+                  <div className="font-medium">{site.name}</div>
+                  {(site.pending_changes ?? 0) > 0 && (
+                    <Badge variant="secondary">{site.pending_changes} pending</Badge>
+                  )}
+                </div>
                 <div className="truncate text-xs text-muted-foreground">
                   {site.url} · every {site.frequency} · {site.fetch_method}
                 </div>
@@ -556,6 +678,13 @@ export function Websites() {
                 Check
               </Button>
               <Button
+                size="sm"
+                variant="outline"
+                onClick={() => navigate(`/pipelines?new=1&website=${site.id}`)}
+              >
+                Pipeline
+              </Button>
+              <Button
                 size="icon"
                 variant="ghost"
                 onClick={() =>
@@ -565,7 +694,7 @@ export function Websites() {
                     .catch((e) => toast.error(String(e)))
                 }
               >
-                <Trash2 className="h-4 w-4 text-red-500" />
+                <Trash2 className="h-4 w-4 text-muted-foreground" />
               </Button>
             </CardContent>
           </Card>
@@ -580,7 +709,7 @@ export function Websites() {
               </CardTitle>
               <div className="flex items-center gap-2">
                 <a
-                  className="inline-flex items-center text-xs text-brand hover:underline"
+                  className="inline-flex items-center text-xs text-foreground underline-offset-4 hover:underline"
                   href={viewer.url}
                   target="_blank"
                   rel="noreferrer"
@@ -594,10 +723,10 @@ export function Websites() {
             </div>
           </CardHeader>
           <CardContent className="space-y-3">
-            <div className="rounded-md border bg-amber-50 p-3 text-xs text-amber-900 dark:bg-amber-950/30 dark:text-amber-200">
+            <div className="rounded-md border bg-muted/40 p-3 text-xs text-muted-foreground">
               Click elements in the rendered preview to select what Autofeeder
               scrapes. The preview is intentionally safe and inert; use{" "}
-              <b>Open original</b> for normal website interaction.
+              <b className="text-foreground">Open original</b> for normal website interaction.
             </div>
             <div className="flex flex-wrap items-end gap-2">
               <div className="min-w-64 flex-1 space-y-1">
@@ -646,7 +775,7 @@ export function Websites() {
               </Button>
             </div>
             {!respectRobots && (
-              <p className="text-xs text-amber-600">
+              <p className="text-xs text-muted-foreground">
                 Robots.txt enforcement is disabled for this explicit request.
                 Continue to respect the site’s terms and rate limits.
               </p>
@@ -732,69 +861,105 @@ export function Websites() {
           </CardContent>
         </Card>
       )}
-      {changes.length > 0 && (
-        <Card>
-          <CardHeader>
-            <CardTitle className="text-base">Latest detected changes</CardTitle>
-          </CardHeader>
-          <CardContent className="space-y-3">
-            {changes.map((change) => (
-              <div key={change.id} className="rounded border p-3">
-                <div className="mb-2 flex items-center justify-between text-xs text-muted-foreground">
-                  <span>
-                    Change #{change.id} · {change.status} · {change.detected_at}
-                  </span>
-                  <div className="flex gap-1">
-                    <Button
-                      size="sm"
-                      variant="outline"
-                      onClick={() =>
-                        api
-                          .extractWebsiteChange(change.id)
-                          .then(() => {
-                            toast.success("Extraction started");
-                            api.updateWebsiteChange(change.id, "processed");
-                            refreshChanges(change.source_id);
-                          })
-                          .catch((e) => toast.error(String(e)))
-                      }
-                    >
-                      <Play className="mr-1 h-3 w-3" /> Extract
-                    </Button>
-                    <Button
-                      size="sm"
-                      variant="ghost"
-                      onClick={() =>
-                        api
-                          .updateWebsiteChange(change.id, "processed")
-                          .then(() => refreshChanges(change.source_id))
-                          .catch((e) => toast.error(String(e)))
-                      }
-                    >
-                      <Check className="mr-1 h-3 w-3" /> Processed
-                    </Button>
-                    <Button
-                      size="sm"
-                      variant="ghost"
-                      onClick={() =>
-                        api
-                          .updateWebsiteChange(change.id, "ignored")
-                          .then(() => refreshChanges(change.source_id))
-                          .catch((e) => toast.error(String(e)))
-                      }
-                    >
-                      <X className="mr-1 h-3 w-3" /> Ignore
-                    </Button>
+        </TabsContent>
+
+        <TabsContent value="changes" className="space-y-4">
+          {changes.length === 0 ? (
+            <EmptyState
+              icon={RefreshCw}
+              title="No pending changes"
+              description="When a monitored page changes meaningfully, it will appear here for review and extraction."
+              actionLabel="View monitors"
+              onAction={() => setTab("monitors")}
+            />
+          ) : (
+            changes.map((change) => (
+              <Card key={change.id}>
+                <CardContent className="space-y-3 p-4">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div>
+                      <div className="font-medium">
+                        {change.website_name || siteName(change.source_id)}
+                      </div>
+                      <div className="text-xs text-muted-foreground">
+                        Change #{change.id} · {change.status} · {change.detected_at}
+                      </div>
+                    </div>
+                    <div className="flex flex-wrap gap-1">
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        onClick={() =>
+                          api
+                            .extractWebsiteChange(change.id)
+                            .then(() => {
+                              toast.success("Extraction started");
+                              load();
+                            })
+                            .catch((e) => toast.error(String(e)))
+                        }
+                      >
+                        <Play className="mr-1 h-3 w-3" /> Extract
+                      </Button>
+                      <Button
+                        size="sm"
+                        variant="ghost"
+                        onClick={() =>
+                          api
+                            .updateWebsiteChange(change.id, "processed")
+                            .then(() => load())
+                            .catch((e) => toast.error(String(e)))
+                        }
+                      >
+                        <Check className="mr-1 h-3 w-3" /> Mark processed
+                      </Button>
+                      <Button
+                        size="sm"
+                        variant="ghost"
+                        onClick={() =>
+                          api
+                            .updateWebsiteChange(change.id, "ignored")
+                            .then(() => load())
+                            .catch((e) => toast.error(String(e)))
+                        }
+                      >
+                        <X className="mr-1 h-3 w-3" /> Ignore
+                      </Button>
+                    </div>
                   </div>
-                </div>
-                <pre className="max-h-64 overflow-auto rounded bg-muted/40 p-3 text-xs">
-                  {change.diff}
-                </pre>
-              </div>
-            ))}
-          </CardContent>
-        </Card>
-      )}
+                  <DiffView diff={change.diff} />
+                </CardContent>
+              </Card>
+            ))
+          )}
+        </TabsContent>
+      </Tabs>
+    </PageShell>
+  );
+}
+
+function DiffView({ diff }: { diff: string }) {
+  const lines = (diff || "").split("\n");
+  if (!diff.trim()) {
+    return <p className="text-sm text-muted-foreground">No diff available.</p>;
+  }
+  return (
+    <div className="max-h-72 overflow-auto rounded border bg-muted/20 p-2 font-mono text-xs">
+      {lines.map((line, i) => {
+        let className = "whitespace-pre-wrap px-1";
+        if (line.startsWith("+") && !line.startsWith("+++")) {
+          className += " bg-foreground/10 text-foreground";
+        } else if (line.startsWith("-") && !line.startsWith("---")) {
+          className += " bg-muted text-muted-foreground line-through";
+        } else if (line.startsWith("@@")) {
+          className += " text-muted-foreground";
+        }
+        return (
+          <div key={i} className={className}>
+            {line || " "}
+          </div>
+        );
+      })}
     </div>
   );
 }

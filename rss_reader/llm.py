@@ -6,7 +6,12 @@ import requests
 
 
 def extract_json(
-    endpoint: str, model: str, api_key: str, prompt: str, snapshot: str
+    endpoint: str,
+    model: str,
+    api_key: str,
+    prompt: str,
+    snapshot: str,
+    timeout: float = 180,
 ) -> object:
     if not endpoint or not model or not prompt or not snapshot:
         raise ValueError("Endpoint, model, prompt, and snapshot are required.")
@@ -25,7 +30,7 @@ def extract_json(
             {"role": "user", "content": f"{prompt}\n\nSNAPSHOT:\n{snapshot}"},
         ],
     }
-    response = requests.post(endpoint, headers=headers, json=payload, timeout=180)
+    response = requests.post(endpoint, headers=headers, json=payload, timeout=timeout)
     response.raise_for_status()
     body = response.json()
     try:

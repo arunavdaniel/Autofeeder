@@ -24,6 +24,7 @@ import {
 } from "lucide-react";
 import { safeJsonParse } from "@/lib/json";
 import { toast } from "sonner";
+import { useNavigate } from "react-router-dom";
 
 function JsonTree({
   value,
@@ -89,6 +90,7 @@ function JsonTree({
 }
 
 export function ApiSources() {
+  const navigate = useNavigate();
   const [items, setItems] = useState<ApiSource[]>([]);
   const [form, setForm] = useState({ name: "", url: "", frequency: "1h" });
   const [busy, setBusy] = useState<number | null>(null);
@@ -270,8 +272,7 @@ export function ApiSources() {
       <div>
         <h1 className="text-2xl font-semibold tracking-tight">API Sources</h1>
         <p className="text-sm text-muted-foreground">
-          Register custom JSON API endpoints to fetch structured data chunks for
-          your extraction pipelines.
+          Poll JSON APIs, then attach them on a pipeline. Catalog APIs live on Discover.
         </p>
       </div>
 
@@ -337,7 +338,15 @@ export function ApiSources() {
           </div>
         ) : items.length === 0 ? (
           <p className="text-sm text-muted-foreground text-center py-6 border rounded-lg bg-card">
-            No API sources registered yet. Add an endpoint URL above to start.
+            No API sources yet. Add a URL above or{" "}
+            <button type="button" className="underline" onClick={() => navigate("/discover")}>
+              Discover APIs
+            </button>
+            , then{" "}
+            <button type="button" className="underline" onClick={() => navigate("/pipelines?new=1")}>
+              create a pipeline
+            </button>
+            .
           </p>
         ) : (
           items.map((site) => (
@@ -364,6 +373,13 @@ export function ApiSources() {
                     onClick={() => openDesigner(site)}
                   >
                     <Wand2 className="mr-1 h-3.5 w-3.5" /> Design
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={() => navigate(`/pipelines?new=1&api=${site.id}`)}
+                  >
+                    Pipeline
                   </Button>
                   <Button
                     size="sm"

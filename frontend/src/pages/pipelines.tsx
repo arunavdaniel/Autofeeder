@@ -1,9 +1,10 @@
-import { useEffect, useMemo, useState } from "react";
-import { useNavigate, useSearchParams } from "react-router-dom";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { useNavigate, useSearchParams, Link } from "react-router-dom";
 import { api } from "@/lib/api";
-import { loadLLM, saveLLM } from "@/lib/llm-settings";
+import { DEFAULT_DB } from "@/lib/onboarding";
+import { loadLLM, saveLLM, configLlmReady } from "@/lib/llm-settings";
 import { safeJsonParse } from "@/lib/json";
-import type { Folder, Pipeline, PipelineDefinition, Snapshot, ApiConfig, PromptTemplate, SchemaDef, DuckDBDatabase, Website, ApiSource, SavedMapping } from "@/lib/types";
+import type { Folder, Pipeline, PipelineDefinition, Snapshot, ApiConfig, PromptTemplate, SchemaDef, DuckDBDatabase, Website, ApiSource, Keyword, RunSummary, PublishChannel, SyncTarget } from "@/lib/types";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
@@ -30,10 +31,18 @@ import {
   Loader2,
   RefreshCw,
   Database,
+  Workflow,
+  Camera,
+  Settings,
 } from "lucide-react";
 import { toast } from "sonner";
+import { PageShell } from "@/components/page-shell";
+import { EmptyState } from "@/components/empty-state";
+import { StatusBadge } from "@/components/status-badge";
+import { EmbeddingModelFields } from "@/components/embedding-model-fields";
+import { outputLabel, sourceCount, hasSources, scheduleLabel, reviewWarnings, usesLlm, pickDatabaseWithRows, pickTableWithRows } from "@/lib/pipeline-utils";
 
-const STEPS = ["Source", "Fetch Settings", "Transforms", "Schema", "Output", "Review"];
+const STEPS = ["Source", "Fetch", "Process", "Schema", "Output", "Review"];
 const TYPES = ["string", "number", "integer", "boolean", "array", "object"];
 
 const DUCK_TYPES = ["VARCHAR", "BIGINT", "DOUBLE", "BOOLEAN", "DATE", "TIMESTAMP", "JSON"];
@@ -92,34 +101,136 @@ function CreateTableButton({ database, table, mappings }: { database: string; ta
   );
 }
 
-function emptyDef(): PipelineDefinition {
-  const s = loadLLM();
+function llmFromDef(def: PipelineDefinition, configs: ApiConfig[] = []) {
+  const local = loadLLM();
+  const cfg = configs.find((c) => c.id === def.api_config_id && configLlmReady(c)) || configs.find(configLlmReady);
   return {
+    enabled: def.llm?.enabled !== false,
+    endpoint: def.llm?.endpoint || local.endpoint || cfg?.endpoint || "",
+    model: def.llm?.model || local.model || cfg?.model || "",
+    api_key: def.llm?.api_key || local.api_key || "",
+  };
+}
+
+function applySavedLlm(def: PipelineDefinition, configs: ApiConfig[]): PipelineDefinition {
+  const llm = llmFromDef(def, configs);
+  const cfg = configs.find((c) => c.id === def.api_config_id) || configs.find(configLlmReady);
+  const api_config_id = def.api_config_id ?? cfg?.id;
+  const transforms = (def.transforms || []).map((t: any) => {
+    if (t.type === "extract" && t.role === "fetch") return t;
+    if (t.type === "extract" || t.type === "synthesize" || t.type === "enrich_llm") {
+      return {
+        ...t,
+        api_config_id: t.api_config_id ?? api_config_id,
+        llm: { ...llm, ...(t.llm || {}), endpoint: t.llm?.endpoint || llm.endpoint, model: t.llm?.model || llm.model, api_key: t.llm?.api_key || llm.api_key },
+      };
+    }
+    return t;
+  });
+  return { ...def, llm, api_config_id, transforms };
+}
+
+function applyDuckOutput(def: PipelineDefinition, duckDbs: DuckDBDatabase[]): PipelineDefinition {
+  const cur = def.output?.database || "";
+  if (cur && cur !== DEFAULT_DB) return def;
+  const picked = pickDatabaseWithRows(duckDbs);
+  if (!picked) return def;
+  const table = pickTableWithRows(picked.stats?.tables || []) || def.output?.table || "articles";
+  return {
+    ...def,
+    output: {
+      type: def.output?.type || "duckdb",
+      database: picked.path,
+      table,
+      mode: def.output?.mode ?? "append",
+      mappings: def.output?.mappings || [],
+      dedupe_key: def.output?.dedupe_key ?? "article_url",
+    },
+  };
+}
+
+function longDocumentTransforms(def: PipelineDefinition) {
+  const llm = llmFromDef(def);
+  return [
+    { type: "extract", role: "fetch", mode: "raw", label: "Fetch full article" },
+    {
+      type: "chunk",
+      chunk_size: def.embeddings?.chunk_size ?? 800,
+      chunk_overlap: def.embeddings?.chunk_overlap ?? 120,
+      strategy: def.embeddings?.strategy ?? "paragraph",
+      min_words: 0,
+      generate_vectors: false,
+      split_pipeline_stream: true,
+      filter_by_keywords: false,
+    },
+    { type: "keyword_filter", keywords_str: "", use_saved_keywords: true, match_all: false },
+    {
+      type: "extract",
+      role: "chunk",
+      mode: "llm",
+      label: "Per-chunk extract",
+      llm,
+      prompt:
+        def.prompt ||
+        "Extract facts, entities, and claims from this passage only. Return JSON. If the passage is not relevant, return {\"relevant\": false}.",
+    },
+    {
+      type: "synthesize",
+      label: "Article output",
+      llm,
+      prompt:
+        "Combine the passage extracts into one structured record for the full article. Ignore passages marked not relevant. Return a single JSON object matching the output schema.",
+    },
+  ];
+}
+
+function simpleArticleTransforms(def: PipelineDefinition) {
+  return [
+    {
+      type: "extract",
+      role: "article",
+      mode: "auto",
+      label: "Extract article",
+      hybrid_llm_fill: false,
+      llm: llmFromDef(def),
+      prompt: def.prompt || "Extract structured fields from this article.",
+    },
+  ];
+}
+
+function emptyDef(configs: ApiConfig[] = [], duckDbs: DuckDBDatabase[] = []): PipelineDefinition {
+  const s = loadLLM();
+  const cfg = configs.find(configLlmReady);
+  const def: PipelineDefinition = {
     sources: [],
     transforms: [],
     date_filter: { enabled: false, from: "", to: "" },
     max_articles: 20,
-    use_browser: true,
+    use_browser: false,
     extraction_mode: "auto",
     hybrid_llm_fill: false,
+    api_config_id: cfg?.id,
     llm: {
       enabled: true,
-      endpoint: s.endpoint || "https://api.openai.com/v1/chat/completions",
-      model: s.model,
+      endpoint: s.endpoint || cfg?.endpoint || "",
+      model: s.model || cfg?.model || "",
       api_key: s.api_key,
     },
     prompt: s.prompt,
     fields: [],
-    output: { type: "duckdb", database: "", table: "extracted_records", mode: "append", mappings: [] },
+    output: { type: "duckdb", database: DEFAULT_DB, table: "articles", mode: "append", mappings: [], dedupe_key: "article_url" },
     run_on_change: false,
     retries: 0,
     concurrency: 1,
     timeout: 60,
     dedup: true,
     change_detection: false,
-    embeddings: { enabled: false, provider: "local", model: "local-hash", chunk_size: 800, chunk_overlap: 120, strategy: "paragraph", top_k: 5, min_words: 0, filter_by_keywords: false, generate_vectors: false },
+    embeddings: { enabled: false, provider: "local", model: "all-MiniLM-L6-v2", chunk_size: 800, chunk_overlap: 120, strategy: "paragraph", top_k: 5, min_words: 0, filter_by_keywords: false, generate_vectors: false },
     schedule: { enabled: false, kind: "interval", minutes: 60 },
+    snapshot: { enabled: false, kind: "interval", minutes: 60, dest: { database: DEFAULT_DB, table: "snapshot_articles", dedupe_key: "url" } },
   };
+  def.transforms = longDocumentTransforms(def);
+  return applyDuckOutput(applySavedLlm(def, configs), duckDbs);
 }
 
 export function Pipelines() {
@@ -137,8 +248,9 @@ export function Pipelines() {
   const [duckDbs, setDuckDbs] = useState<DuckDBDatabase[]>([]);
   const [websites, setWebsites] = useState<Website[]>([]);
   const [apiSources, setApiSources] = useState<ApiSource[]>([]);
-  const [mappings, setMappings] = useState<SavedMapping[]>([]);
+  const [keywords, setKeywords] = useState<Keyword[]>([]);
   const [busy, setBusy] = useState(false);
+  const [lastRuns, setLastRuns] = useState<Record<number, RunSummary>>({});
 
   const load = () => {
     api.pipelines().then(setPipelines).catch(() => {});
@@ -150,15 +262,25 @@ export function Pipelines() {
     api.duckdbDatabases().then(setDuckDbs).catch(() => {});
     api.websites().then(setWebsites).catch(() => {});
     api.apiSources().then(setApiSources).catch(() => {});
-    api.mappings().then(setMappings).catch(() => {});
+    api.keywords().then(setKeywords).catch(() => {});
+    api
+      .runsFiltered({ limit: 80, offset: 0 })
+      .then((res) => {
+        const map: Record<number, RunSummary> = {};
+        for (const run of res.runs || []) {
+          if (run.pipeline_id != null && map[run.pipeline_id] == null) map[run.pipeline_id] = run;
+        }
+        setLastRuns(map);
+      })
+      .catch(() => {});
   };
   useEffect(() => { load(); }, []);
 
-  const def = editing || emptyDef();
+  const def = editing || emptyDef(apiConfigs, duckDbs);
   const set = (patch: Partial<PipelineDefinition>) => setEditing({ ...def, ...patch });
 
   const startNew = () => {
-    setEditing(emptyDef());
+    setEditing(emptyDef(apiConfigs, duckDbs));
     setEditingId(null);
     setStep(0);
   };
@@ -175,9 +297,68 @@ export function Pipelines() {
   // deep-link presets
   const folderParam = params.get("folder");
   const snapshotParam = params.get("snapshot");
+  const modeParam = params.get("mode");
+  const newParam = params.get("new");
+  const editParam = params.get("edit") || params.get("id");
+  const feedsParam = params.get("feeds");
+  const websiteParam = params.get("website");
+  const apiParam = params.get("api");
+  const dbParam = params.get("db");
+  const tableParam = params.get("table");
+  const deepLinkKey = [
+    editParam,
+    newParam,
+    modeParam,
+    folderParam,
+    snapshotParam,
+    feedsParam,
+    websiteParam,
+    apiParam,
+    dbParam,
+    tableParam,
+  ].join("|");
+  const appliedDeepLink = useRef("");
   useEffect(() => {
-    if (!editing && (folderParam || snapshotParam) && folders.length) {
-      const d = emptyDef();
+    if (editing && appliedDeepLink.current === deepLinkKey) return;
+    if (editParam && pipelines.length) {
+      const p = pipelines.find((x) => String(x.id) === editParam);
+      if (p) {
+        startEdit(p);
+        appliedDeepLink.current = deepLinkKey;
+      }
+      return;
+    }
+    if (newParam === "1") {
+      const d = emptyDef(apiConfigs, duckDbs);
+      if (feedsParam) {
+        const ids = feedsParam.split(",").map(Number).filter((n) => Number.isFinite(n) && n > 0);
+        if (ids.length) d.sources = [{ type: "feeds", feed_ids: ids }];
+      }
+      if (websiteParam) d.sources = [{ type: "websites", website_ids: [Number(websiteParam)] }];
+      if (apiParam) d.sources = [{ type: "api_sources", api_source_ids: [Number(apiParam)] }];
+      if (dbParam) d.output = { ...d.output!, database: dbParam };
+      if (tableParam) d.output = { ...d.output!, table: tableParam };
+      setEditing(d);
+      setEditingId(null);
+      setStep(0);
+      appliedDeepLink.current = deepLinkKey;
+      return;
+    }
+    if (modeParam === "snapshot") {
+      const d = emptyDef(apiConfigs, duckDbs);
+      d.name = "Scheduled snapshot";
+      d.llm = { ...d.llm!, enabled: false };
+      d.extraction_mode = "raw";
+      d.transforms = [{ type: "extract", role: "fetch", mode: "raw", label: "Fetch full article" }];
+      d.snapshot = { enabled: true, kind: "interval", minutes: 60, dest: { database: DEFAULT_DB, table: "snapshot_articles", dedupe_key: "url" } };
+      setEditing(d);
+      setEditingId(null);
+      setStep(0);
+      appliedDeepLink.current = deepLinkKey;
+      return;
+    }
+    if ((folderParam || snapshotParam) && folders.length) {
+      const d = emptyDef(apiConfigs, duckDbs);
       if (folderParam) {
         const f = folders.find((x) => String(x.id) === folderParam);
         if (f) {
@@ -188,132 +369,44 @@ export function Pipelines() {
       if (snapshotParam) {
         d.sources = [{ type: "snapshot", snapshot_id: Number(snapshotParam) }];
         const s = snapshots.find((x) => String(x.id) === snapshotParam);
-        d.name = s ? `Pipeline on ${s.name}` : "Pipeline on snapshot";
+        d.name = s ? `Pipeline on ${s.name || s.source || "snapshot"}` : "Pipeline on snapshot";
       }
       setEditing(d);
+      appliedDeepLink.current = deepLinkKey;
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [folders, snapshots, folderParam, snapshotParam]);
+  }, [folders, snapshots, pipelines, deepLinkKey]);
 
-  const [activeSourceTab, setActiveSourceTab] = useState<"feeds" | "websites" | "api_sources">("feeds");
-
-  const getSelectedFeedIds = (): number[] => {
-    const src = def.sources?.find((s) => s.type === "feeds");
-    return src?.feed_ids ?? [];
-  };
-
-  const toggleFeedId = (id: number) => {
-    const currentSources = def.sources ?? [];
-    const feedsSource = currentSources.find((s) => s.type === "feeds");
-    let updated;
-    if (feedsSource) {
-      const feed_ids = feedsSource.feed_ids ?? [];
-      const updatedIds = feed_ids.includes(id) ? feed_ids.filter((x) => x !== id) : [...feed_ids, id];
-      updated = currentSources.map((s) => s.type === "feeds" ? { ...s, feed_ids: updatedIds } : s);
-    } else {
-      updated = [...currentSources, { type: "feeds", feed_ids: [id] }];
-    }
-    set({ sources: updated });
-  };
-
-  const getSelectedWebsiteIds = (): number[] => {
-    const src = def.sources?.find((s) => s.type === "websites");
-    return src?.website_ids ?? [];
-  };
-
-  const toggleWebsiteId = (id: number) => {
-    const currentSources = def.sources ?? [];
-    const webSource = currentSources.find((s) => s.type === "websites");
-    let updated;
-    if (webSource) {
-      const website_ids = webSource.website_ids ?? [];
-      const updatedIds = website_ids.includes(id) ? website_ids.filter((x) => x !== id) : [...website_ids, id];
-      updated = currentSources.map((s) => s.type === "websites" ? { ...s, website_ids: updatedIds } : s);
-    } else {
-      updated = [...currentSources, { type: "websites", website_ids: [id] }];
-    }
-    set({ sources: updated });
-  };
-
-  const getSelectedApiSourceIds = (): number[] => {
-    const src = def.sources?.find((s) => s.type === "api_sources");
-    return src?.api_source_ids ?? [];
-  };
-
-  const toggleApiSourceId = (id: number) => {
-    const currentSources = def.sources ?? [];
-    const apiSource = currentSources.find((s) => s.type === "api_sources");
-    let updated;
-    if (apiSource) {
-      const api_source_ids = apiSource.api_source_ids ?? [];
-      const updatedIds = api_source_ids.includes(id) ? api_source_ids.filter((x) => x !== id) : [...api_source_ids, id];
-      updated = currentSources.map((s) => s.type === "api_sources" ? { ...s, api_source_ids: updatedIds } : s);
-    } else {
-      updated = [...currentSources, { type: "api_sources", api_source_ids: [id] }];
-    }
-    set({ sources: updated });
-  };
-
-  const updateTransform = (i: number, patch: any) => {
-    const list = def.transforms || [];
-    set({
-      transforms: list.map((t, idx) => (idx === i ? { ...t, ...patch } : t))
+  useEffect(() => {
+    if (editingId != null) return;
+    setEditing((cur) => {
+      if (!cur) return cur;
+      const next = applyDuckOutput(applySavedLlm(cur, apiConfigs), duckDbs);
+      if (
+        next.llm?.model === cur.llm?.model &&
+        next.llm?.endpoint === cur.llm?.endpoint &&
+        next.api_config_id === cur.api_config_id &&
+        next.output?.database === cur.output?.database &&
+        next.output?.table === cur.output?.table
+      ) {
+        return cur;
+      }
+      return next;
     });
-  };
+  }, [apiConfigs, duckDbs, editingId]);
 
-  const removeTransform = (i: number) => {
-    set({
-      transforms: (def.transforms || []).filter((_, idx) => idx !== i)
-    });
-  };
 
-  const addTransform = (type: "keyword_filter" | "extract" | "enrich_llm" | "chunk") => {
-    const list = def.transforms || [];
-    let newStep: any = { type };
-    if (type === "extract") {
-      newStep = {
-        type,
-        mode: "auto",
-        hybrid_llm_fill: false,
-        llm: { enabled: true, endpoint: "https://api.openai.com/v1/chat/completions", model: "gpt-4o-mini" },
-        prompt: "Extract structured fields from this content.",
-      };
-    } else if (type === "enrich_llm") {
-      newStep = {
-        type,
-        output_field: "summary",
-        llm: { enabled: true, endpoint: "https://api.openai.com/v1/chat/completions", model: "gpt-4o-mini" },
-        prompt: "Summarize this article in 2 sentences.",
-      };
-    } else if (type === "chunk") {
-      newStep = {
-        type,
-        chunk_size: 800,
-        chunk_overlap: 120,
-        min_words: 0,
-        generate_vectors: false,
-        provider: "local",
-        model: "local-hash",
-      };
-    } else if (type === "keyword_filter") {
-      newStep = {
-        type,
-        keywords_str: "",
-        match_all: false,
-      };
-    }
-    set({ transforms: [...list, newStep] });
-  };
 
   const save = async (): Promise<number | null> => {
     if (!def.name?.trim()) {
-      toast.error("Set a pipeline name in the Review step.");
-      setStep(5);
+      toast.error("Name this pipeline on the first step before saving.");
+      setStep(0);
       return null;
     }
     setBusy(true);
     try {
-      const res = await api.savePipeline(def.name.trim(), def);
+      const res = await api.savePipeline(def.name.trim(), def, editingId);
+      setEditingId(res.id);
       saveLLM({
         endpoint: def.llm?.endpoint ?? "",
         model: def.llm?.model ?? "",
@@ -323,6 +416,7 @@ export function Pipelines() {
         firecrawl_base_url: def.firecrawl_base_url ?? loadLLM().firecrawl_base_url,
       });
       toast.success("Pipeline saved.");
+      load();
       return res.id;
     } catch (e) {
       toast.error(String(e));
@@ -361,7 +455,7 @@ export function Pipelines() {
         duckDbs={duckDbs}
         websites={websites}
         apiSources={apiSources}
-        mappings={mappings}
+        keywords={keywords}
         busy={busy}
         onBack={() => {
           setEditing(null);
@@ -374,55 +468,131 @@ export function Pipelines() {
   }
 
   return (
-    <div className="mx-auto max-w-4xl space-y-6 p-8">
-      <div className="flex items-center justify-between">
-        <div>
-          <h1 className="text-2xl font-semibold tracking-tight">Pipelines</h1>
-          <p className="text-sm text-muted-foreground">Build workflows that turn feed articles into records.</p>
-        </div>
-        <div className="flex items-center gap-2">
+    <PageShell
+      title="Pipelines"
+      description="The core loop: sources in, structured rows out, optional publish/sync."
+      width="4xl"
+      actions={
+        <>
           <Button variant="outline" size="sm" onClick={load} title="Refresh">
             <RefreshCw className="h-4 w-4" />
+          </Button>
+          <Button
+            variant="outline"
+            onClick={() => {
+              const d = emptyDef(apiConfigs, duckDbs);
+              d.name = "Scheduled snapshot";
+              d.llm = { ...d.llm!, enabled: false };
+              d.extraction_mode = "raw";
+              d.transforms = [{ type: "extract", role: "fetch", mode: "raw", label: "Fetch full article" }];
+              d.snapshot = {
+                enabled: true,
+                kind: "interval",
+                minutes: 60,
+                dest: { database: DEFAULT_DB, table: "snapshot_articles", dedupe_key: "url" },
+              };
+              setEditing(d);
+              setEditingId(null);
+              setStep(0);
+            }}
+          >
+            <Camera className="mr-1 h-4 w-4" /> Snapshot job
           </Button>
           <Button onClick={startNew}>
             <Plus className="mr-1 h-4 w-4" /> New pipeline
           </Button>
-        </div>
-      </div>
+        </>
+      }
+    >
       <div className="space-y-2">
         {pipelines.length === 0 && (
-          <Card>
-            <CardContent className="py-10 text-center text-sm text-muted-foreground">
-              No pipelines yet. Create one to get started.
-            </CardContent>
-          </Card>
+          <EmptyState
+            icon={Workflow}
+            title="No pipelines yet"
+            description="Pick sources, map fields to a DuckDB table, then Run. Attach publish/sync on Output after you create them on Exports."
+            actionLabel="New pipeline"
+            onAction={startNew}
+            secondaryLabel="Add a source"
+            onSecondary={() => navigate("/discover")}
+          />
         )}
-        {pipelines.map((p) => (
-          <Card key={p.id}>
-            <CardContent className="flex items-center gap-3 py-4">
+        {pipelines.map((p) => {
+          const last = lastRuns[p.id];
+          const db = p.definition.output?.database;
+          const table = p.definition.output?.table;
+          const sched = scheduleLabel(p.definition);
+          return (
+          <Card key={p.id} className="transition-all hover:shadow-md">
+            <CardContent className="flex flex-col gap-3 py-4 sm:flex-row sm:items-center">
               <div className="min-w-0 flex-1">
-                <div className="font-medium">{p.name}</div>
-                <div className="text-xs text-muted-foreground">
-                  {(p.definition.feed_ids?.length ?? 0)} sources · DuckDB output
+                <div className="flex flex-wrap items-center gap-2">
+                  <div className="font-medium">{p.name}</div>
+                  {last && <StatusBadge status={last.status} />}
                 </div>
+                <div className="text-xs text-muted-foreground">
+                  {sourceCount(p.definition)} sources · {outputLabel(p.definition)}
+                  {sched ? ` · ${sched}` : ""}
+                </div>
+                {last && (
+                  <button
+                    type="button"
+                    className="mt-1 text-[11px] text-muted-foreground underline-offset-2 hover:underline"
+                    onClick={() => navigate(`/runs?id=${last.id}`)}
+                  >
+                    Last run #{last.id}
+                    {last.records_count != null ? ` · ${last.records_count} rows` : ""}
+                    {last.error_count ? ` · ${last.error_count} errors` : ""}
+                    {last.created_at ? ` · ${last.created_at.slice(0, 16).replace("T", " ")}` : ""}
+                  </button>
+                )}
               </div>
-              <Button size="sm" variant="outline" onClick={() => api.runPipeline(p.id, false).then((r) => navigate(`/runs?id=${r.run_id}`)).catch((e) => toast.error(String(e)))}>
-                <Play className="mr-1 h-3.5 w-3.5" /> Run
-              </Button>
-              <Button size="sm" variant="outline" onClick={() => api.runPipeline(p.id, true).then((r) => navigate(`/runs?id=${r.run_id}`)).catch((e) => toast.error(String(e)))}>
-                <Eye className="mr-1 h-3.5 w-3.5" /> Preview
-              </Button>
-              <Button size="sm" variant="ghost" onClick={() => startEdit(p)}>
-                <Pencil className="h-3.5 w-3.5" />
-              </Button>
-              <Button size="sm" variant="ghost" onClick={() => del(p.id)}>
-                <Trash2 className="h-3.5 w-3.5 text-red-500" />
-              </Button>
+              <div className="flex flex-wrap gap-2">
+                <Button
+                  size="sm"
+                  onClick={() =>
+                    api
+                      .runPipeline(p.id, false)
+                      .then((r) => navigate(`/runs?id=${r.run_id}`))
+                      .catch((e) => toast.error(String(e)))
+                  }
+                >
+                  <Play className="mr-1 h-3.5 w-3.5" /> Run
+                </Button>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={() =>
+                    api
+                      .runPipeline(p.id, true)
+                      .then((r) => navigate(`/runs?id=${r.run_id}`))
+                      .catch((e) => toast.error(String(e)))
+                  }
+                >
+                  <Eye className="mr-1 h-3.5 w-3.5" /> Preview
+                </Button>
+                {db && table && (
+                  <Button size="sm" variant="outline" onClick={() => navigate(`/duckdb?db=${encodeURIComponent(db)}&table=${encodeURIComponent(table)}`)}>
+                    <Database className="mr-1 h-3.5 w-3.5" /> Open data
+                  </Button>
+                )}
+                {last && (
+                  <Button size="sm" variant="outline" onClick={() => navigate(`/runs?id=${last.id}`)}>
+                    Last run
+                  </Button>
+                )}
+                <Button size="sm" variant="ghost" onClick={() => startEdit(p)}>
+                  <Pencil className="mr-1 h-3.5 w-3.5" /> Edit
+                </Button>
+                <Button size="sm" variant="ghost" onClick={() => del(p.id)}>
+                  <Trash2 className="h-3.5 w-3.5 text-destructive" />
+                </Button>
+              </div>
             </CardContent>
           </Card>
-        ))}
+          );
+        })}
       </div>
-    </div>
+    </PageShell>
   );
 }
 
@@ -439,24 +609,169 @@ function Builder(props: {
   duckDbs: DuckDBDatabase[];
   websites: Website[];
   apiSources: ApiSource[];
-  mappings: SavedMapping[];
+  keywords: Keyword[];
   busy: boolean;
   onBack: () => void;
   onSave: () => Promise<number | null>;
   onRun: (preview: boolean) => void;
 }) {
-  const { def, set, step, setStep, folders, snapshots, apiConfigs, prompts, schemas, duckDbs, websites, apiSources, mappings, busy, onBack, onSave, onRun } = props;
-  const sourceType = def.source?.type ?? "feeds";
+  const { def, set, step, setStep, folders, snapshots, apiConfigs, prompts, schemas, duckDbs, websites, apiSources, keywords, busy, onBack, onSave, onRun } = props;
   const [suggesting, setSuggesting] = useState(false);
+  const [activeSourceTab, setActiveSourceTab] = useState<"feeds" | "websites" | "api_sources" | "snapshots">("feeds");
+  const [channels, setChannels] = useState<PublishChannel[]>([]);
+  const [syncTargets, setSyncTargets] = useState<SyncTarget[]>([]);
+  useEffect(() => {
+    api.publishChannels().then(setChannels).catch(() => {});
+    api.syncTargets().then(setSyncTargets).catch(() => {});
+  }, []);
 
-  const toggleFeed = (id: number, on: boolean) => {
-    const cur = def.source?.feed_ids ?? [];
-    const next = on ? [...cur, id] : cur.filter((x) => x !== id);
-    set({ source: { ...def.source!, feed_ids: next }, feed_ids: next });
+  const llmReady = Boolean(
+    (def.llm?.endpoint || loadLLM().endpoint)?.trim() && (def.llm?.model || loadLLM().model)?.trim(),
+  ) || apiConfigs.some(configLlmReady);
+  const showLlmGap = usesLlm(def) && !llmReady;
+  const issues = reviewWarnings(def, llmReady);
+  const goNext = () => {
+    if (step === 0 && !hasSources(def)) {
+      toast.error("Select at least one source before continuing.");
+      return;
+    }
+    setStep(Math.min(5, step + 1));
   };
 
-  const setSourceType = (t: "feeds" | "snapshot" | "websites" | "api" | "api_sources") =>
-    set({ source: { ...def.source!, type: t } });
+  const getSelectedFeedIds = (): number[] => {
+    const src = def.sources?.find((s) => s.type === "feeds");
+    return src?.feed_ids ?? [];
+  };
+
+  const toggleFeedId = (id: number) => {
+    const currentSources = def.sources ?? [];
+    const feedsSource = currentSources.find((s) => s.type === "feeds");
+    let updated;
+    if (feedsSource) {
+      const feed_ids = feedsSource.feed_ids ?? [];
+      const updatedIds = feed_ids.includes(id) ? feed_ids.filter((x) => x !== id) : [...feed_ids, id];
+      updated = currentSources.map((s) => s.type === "feeds" ? { ...s, feed_ids: updatedIds } : s);
+    } else {
+      updated = [...currentSources, { type: "feeds" as const, feed_ids: [id] }];
+    }
+    set({ sources: updated });
+  };
+
+  const getSelectedWebsiteIds = (): number[] => {
+    const src = def.sources?.find((s) => s.type === "websites");
+    return src?.website_ids ?? [];
+  };
+
+  const toggleWebsiteId = (id: number) => {
+    const currentSources = def.sources ?? [];
+    const webSource = currentSources.find((s) => s.type === "websites");
+    let updated;
+    if (webSource) {
+      const website_ids = webSource.website_ids ?? [];
+      const updatedIds = website_ids.includes(id) ? website_ids.filter((x) => x !== id) : [...website_ids, id];
+      updated = currentSources.map((s) => s.type === "websites" ? { ...s, website_ids: updatedIds } : s);
+    } else {
+      updated = [...currentSources, { type: "websites" as const, website_ids: [id] }];
+    }
+    set({ sources: updated });
+  };
+
+  const getSelectedApiSourceIds = (): number[] => {
+    const src = def.sources?.find((s) => s.type === "api_sources");
+    return src?.api_source_ids ?? [];
+  };
+
+  const toggleApiSourceId = (id: number) => {
+    const currentSources = def.sources ?? [];
+    const apiSource = currentSources.find((s) => s.type === "api_sources");
+    let updated;
+    if (apiSource) {
+      const api_source_ids = apiSource.api_source_ids ?? [];
+      const updatedIds = api_source_ids.includes(id) ? api_source_ids.filter((x) => x !== id) : [...api_source_ids, id];
+      updated = currentSources.map((s) => s.type === "api_sources" ? { ...s, api_source_ids: updatedIds } : s);
+    } else {
+      updated = [...currentSources, { type: "api_sources" as const, api_source_ids: [id] }];
+    }
+    set({ sources: updated });
+  };
+
+  const getSelectedSnapshotId = (): number | undefined => {
+    return def.sources?.find((s) => s.type === "snapshot")?.snapshot_id;
+  };
+
+  const toggleSnapshotId = (id: number) => {
+    const currentSources = def.sources ?? [];
+    const current = currentSources.find((s) => s.type === "snapshot");
+    const rest = currentSources.filter((s) => s.type !== "snapshot");
+    if (current?.snapshot_id === id) {
+      set({ sources: rest });
+    } else {
+      set({ sources: [...rest, { type: "snapshot" as const, snapshot_id: id }] });
+    }
+  };
+
+  const updateTransform = (i: number, patch: any) => {
+    const list = def.transforms || [];
+    set({
+      transforms: list.map((t, idx) => (idx === i ? { ...t, ...patch } : t))
+    });
+  };
+
+  const removeTransform = (i: number) => {
+    set({
+      transforms: (def.transforms || []).filter((_, idx) => idx !== i)
+    });
+  };
+
+  const addTransform = (type: "keyword_filter" | "extract" | "enrich_llm" | "chunk" | "synthesize") => {
+    const list = def.transforms || [];
+    let newStep: any = { type };
+    if (type === "extract") {
+      newStep = {
+        type,
+        role: "article",
+        mode: "auto",
+        hybrid_llm_fill: false,
+        llm: llmFromDef(def),
+        prompt: "Extract structured fields from this content.",
+      };
+    } else if (type === "enrich_llm") {
+      newStep = {
+        type,
+        output_field: "summary",
+        llm: llmFromDef(def),
+        prompt: "Summarize this article in 2 sentences.",
+      };
+    } else if (type === "chunk") {
+      newStep = {
+        type,
+        chunk_size: 800,
+        chunk_overlap: 120,
+        min_words: 0,
+        generate_vectors: false,
+        split_pipeline_stream: true,
+        filter_by_keywords: false,
+        provider: "local",
+        model: "all-MiniLM-L6-v2",
+        endpoint: "",
+        api_key: "",
+      };
+    } else if (type === "keyword_filter") {
+      newStep = {
+        type,
+        keywords_str: "",
+        use_saved_keywords: true,
+        match_all: false,
+      };
+    } else if (type === "synthesize") {
+      newStep = {
+        type,
+        llm: llmFromDef(def),
+        prompt: "Combine the passage extracts into one structured record for the full article.",
+      };
+    }
+    set({ transforms: [...list, newStep] });
+  };
 
   const chooseSchema = (id: string) => {
     const schema = schemas.find((x) => String(x.id) === id);
@@ -486,21 +801,7 @@ function Builder(props: {
     set(patch);
   };
 
-  const applySavedMapping = (id: string) => {
-    const m = mappings.find((x) => String(x.id) === id);
-    if (!m) return;
-    set({
-      schema_id: m.schema_id ?? def.schema_id,
-      output: {
-        type: "duckdb",
-        database: m.database ?? def.output?.database ?? "",
-        table: m.table ?? def.output?.table ?? "extracted_records",
-        mode: def.output?.mode ?? "append",
-        mappings: m.columns.map((c) => ({ source: c.source, target: c.target, type: c.type || "VARCHAR" })),
-      },
-    });
-    toast.success(`Loaded mapping "${m.name}" into output`);
-  };
+
 
   const [testing, setTesting] = useState(false);
   const test = async () => {
@@ -524,8 +825,12 @@ function Builder(props: {
   };
 
   const suggest = async () => {
-    if (!def.llm?.endpoint || !def.llm?.model || !def.prompt) {
-      toast.error("Set endpoint, model and prompt first.");
+    const promptFromSteps =
+      [...(def.transforms || [])].reverse().find((t: any) => t.type === "synthesize" && t.prompt)?.prompt ||
+      [...(def.transforms || [])].reverse().find((t: any) => t.type === "extract" && t.prompt)?.prompt ||
+      def.prompt;
+    if (!def.llm?.endpoint || !def.llm?.model || !promptFromSteps) {
+      toast.error("Set an LLM endpoint/model and a prompt on an extract or article-output step first.");
       return;
     }
     setSuggesting(true);
@@ -534,7 +839,7 @@ function Builder(props: {
         endpoint: def.llm.endpoint,
         model: def.llm.model,
         api_key: def.llm.api_key || "",
-        prompt: def.prompt,
+        prompt: promptFromSteps,
       });
       const propsObj = res.schema.properties || {};
       const fields = Object.entries(propsObj).map(([name, v]: [string, any]) => ({
@@ -560,10 +865,10 @@ function Builder(props: {
     set({ fields: (def.fields || []).filter((_, idx) => idx !== i) });
 
   return (
-    <div className="mx-auto max-w-3xl space-y-5 p-8">
+    <div className="mx-auto max-w-3xl space-y-5 p-8 pb-24">
       <div className="flex items-center justify-between">
         <Button variant="ghost" onClick={onBack}>
-          <ArrowLeft className="mr-1 h-4 w-4" /> Back
+          <ArrowLeft className="mr-1 h-4 w-4" /> All pipelines
         </Button>
         <div className="flex items-center gap-1">
           {STEPS.map((s, i) => (
@@ -584,13 +889,18 @@ function Builder(props: {
         <CardContent className="space-y-4 pt-6">
           {step === 0 && (
             <div className="space-y-4">
+              <div className="space-y-1">
+                <Label>Pipeline name</Label>
+                <Input value={def.name ?? ""} onChange={(e) => set({ name: e.target.value })} placeholder="e.g. News → DuckDB" />
+              </div>
               <div className="space-y-2">
                 <Label>Source type</Label>
-                <div className="flex gap-1 rounded-lg border bg-muted p-1">
+                <div className="flex flex-wrap gap-1 rounded-lg border bg-muted p-1">
                   {[
-                    { type: "feeds", label: "Live RSS Feeds" },
-                    { type: "websites", label: "Website Monitors" },
-                    { type: "api_sources", label: "API Sources" },
+                    { type: "feeds", label: "Feeds" },
+                    { type: "websites", label: "Websites" },
+                    { type: "api_sources", label: "APIs" },
+                    { type: "snapshots", label: "Snapshots" },
                   ].map((opt) => (
                     <button
                       key={opt.type}
@@ -619,12 +929,20 @@ function Builder(props: {
                           />
                           <span className="flex-1 truncate">{feed.title}</span>
                           <Badge variant="secondary" className="text-[10px] font-normal text-muted-foreground whitespace-nowrap">
-                            No mapping &rarr; LLM
+                            RSS
                           </Badge>
                         </label>
                       ))
                     )}
                   </div>
+                  {folders.every((f) => !f.feeds.length) && (
+                    <p className="text-xs text-muted-foreground">
+                      No feeds yet.{" "}
+                      <Link className="underline" to="/discover">Discover</Link>
+                      {" · "}
+                      <Link className="underline" to="/sources">Add a feed</Link>
+                    </p>
+                  )}
                   <div className="space-y-1">
                     <Label>Max articles per feed</Label>
                     <Input
@@ -655,9 +973,13 @@ function Builder(props: {
                       );
                     })}
                   </div>
-                  {websites.length === 0 && <p className="text-xs text-muted-foreground">Add a website monitor first.</p>}
+                  {websites.length === 0 && (
+                    <p className="text-xs text-muted-foreground">
+                      No website monitors yet. <Link className="underline" to="/websites">Add a website</Link>
+                    </p>
+                  )}
                 </div>
-              ) : (
+              ) : activeSourceTab === "api_sources" ? (
                 <div className="space-y-2">
                   <Label>API sources</Label>
                   <div className="grid gap-2 sm:grid-cols-2">
@@ -680,7 +1002,39 @@ function Builder(props: {
                       );
                     })}
                   </div>
-                  {apiSources.length === 0 && <p className="text-xs text-muted-foreground">Add an API source first.</p>}
+                  {apiSources.length === 0 && (
+                    <p className="text-xs text-muted-foreground">
+                      No API sources yet. <Link className="underline" to="/api-sources">Add an API</Link>
+                    </p>
+                  )}
+                </div>
+              ) : (
+                <div className="space-y-2">
+                  <Label>Captured snapshots</Label>
+                  <div className="grid gap-2 sm:grid-cols-2">
+                    {snapshots.map((snap) => {
+                      const label = (snap.name || snap.source || snap.source_label || `Snapshot ${snap.id}`).trim();
+                      return (
+                        <label key={snap.id} className="flex items-center gap-2 rounded-md border p-2 text-sm cursor-pointer hover:bg-accent/40 transition-colors">
+                          <Checkbox
+                            checked={getSelectedSnapshotId() === snap.id}
+                            onCheckedChange={() => toggleSnapshotId(snap.id)}
+                          />
+                          <span className="flex-1 truncate">{label}</span>
+                          <Badge variant="secondary" className="text-[10px] font-normal">
+                            {snap.article_count ?? 0}
+                          </Badge>
+                        </label>
+                      );
+                    })}
+                  </div>
+                  {snapshots.length === 0 && (
+                    <p className="text-xs text-muted-foreground">
+                      No snapshots yet. <Link className="underline" to="/snapshots">Capture one</Link>
+                      {" or "}
+                      <Link className="underline" to="/pipelines?mode=snapshot">create a snapshot job</Link>
+                    </p>
+                  )}
                 </div>
               )}
 
@@ -693,7 +1047,10 @@ function Builder(props: {
                   {getSelectedWebsiteIds().length} Website{getSelectedWebsiteIds().length !== 1 ? "s" : ""}
                 </Badge>
                 <Badge variant={getSelectedApiSourceIds().length ? "default" : "outline"}>
-                  {getSelectedApiSourceIds().length} API Source{getSelectedApiSourceIds().length !== 1 ? "s" : ""}
+                  {getSelectedApiSourceIds().length} API{getSelectedApiSourceIds().length !== 1 ? "s" : ""}
+                </Badge>
+                <Badge variant={getSelectedSnapshotId() ? "default" : "outline"}>
+                  {getSelectedSnapshotId() ? "1 Snapshot" : "0 Snapshots"}
                 </Badge>
               </div>
 
@@ -711,11 +1068,19 @@ function Builder(props: {
           )}
 
           {step === 1 && (
-            <div className="space-y-3 text-sm text-muted-foreground">
-              <p>Autofeeder renders each article with a headless browser (Playwright) and falls back to a fast HTTP fetch when a browser engine is unavailable.</p>
-              <label className="flex items-center gap-2 rounded-md border p-3 cursor-pointer">
-                <Checkbox checked={!!def.use_browser} onCheckedChange={(c) => set({ use_browser: c === true })} />
-                Use headless browser for JavaScript-heavy pages
+            <div className="space-y-4 text-sm">
+              <div>
+                <Label className="text-base font-semibold text-foreground">How to download each page</Label>
+                <p className="mt-1 text-xs text-muted-foreground">
+                  HTTP fetch is the default. Turn on the browser only for pages that need JavaScript. Firecrawl is optional if you already use it.
+                </p>
+              </div>
+              <label className="flex items-start gap-2 rounded-md border p-3 cursor-pointer">
+                <Checkbox className="mt-0.5" checked={!!def.use_browser} onCheckedChange={(c) => set({ use_browser: c === true })} />
+                <span>
+                  <span className="block text-foreground">Use headless browser (Playwright)</span>
+                  <span className="text-xs text-muted-foreground">Slower. Use for JS-heavy sites. Falls back to HTTP if Playwright is unavailable.</span>
+                </span>
               </label>
               <div className="grid gap-3 sm:grid-cols-2">
                 <div className="space-y-1">
@@ -773,11 +1138,27 @@ function Builder(props: {
 
           {step === 2 && (
             <div className="space-y-6">
+              {showLlmGap && (
+                <div className="flex flex-col gap-2 rounded-lg border border-dashed bg-muted/20 p-3 sm:flex-row sm:items-center sm:justify-between">
+                  <p className="text-sm">LLM endpoint and model are not set. Extraction steps that call the model will fail.</p>
+                  <Link to="/settings" className="inline-flex h-8 shrink-0 items-center gap-1 rounded-md border border-input px-3 text-xs font-medium hover:bg-accent">
+                    <Settings className="h-3.5 w-3.5" /> Open Settings
+                  </Link>
+                </div>
+              )}
               <div>
-                <Label className="text-base font-bold text-foreground">Sequential Transformations</Label>
+                <Label className="text-base font-bold text-foreground">How the article is processed</Label>
                 <p className="text-xs text-muted-foreground mt-1">
-                  Configure chainable transform steps that process your fetched data sequentially before writing to the database.
+                  Long pages are fetched, split into chunks, filtered by keywords, extracted with a per-chunk prompt, then combined with a different article prompt.
                 </p>
+                <div className="mt-3 flex flex-wrap gap-2">
+                  <Button type="button" size="sm" variant="secondary" onClick={() => set({ transforms: longDocumentTransforms(def) })}>
+                    Long document recipe
+                  </Button>
+                  <Button type="button" size="sm" variant="outline" onClick={() => set({ transforms: simpleArticleTransforms(def) })}>
+                    One LLM call per article
+                  </Button>
+                </div>
               </div>
 
               <div className="space-y-4">
@@ -788,17 +1169,24 @@ function Builder(props: {
                         <Badge variant="default" className="text-[10px] font-semibold uppercase">
                           Step {i + 1}
                         </Badge>
-                        <span className="font-semibold text-sm capitalize">
-                          {t.type === "keyword_filter"
-                            ? "🔍 Keyword Filter"
+                        <span className="font-semibold text-sm">
+                          {t.label
+                            || (t.type === "keyword_filter"
+                            ? "Keyword filter"
+                            : t.type === "extract" && t.role === "chunk"
+                            ? "Per-chunk extract"
+                            : t.type === "extract" && t.role === "fetch"
+                            ? "Fetch full article"
                             : t.type === "extract"
-                            ? "✨ Schema Extraction"
+                            ? "Extract"
                             : t.type === "enrich_llm"
-                            ? "🤖 AI Enrichment"
-                            : "📦 Vector Chunking"}
+                            ? "AI enrichment"
+                            : t.type === "synthesize"
+                            ? "Article output"
+                            : "Chunk")}
                         </span>
                       </div>
-                      <Button size="icon" variant="ghost" className="h-8 w-8 text-red-500 hover:text-red-700 hover:bg-red-50" onClick={() => removeTransform(i)}>
+                      <Button size="icon" variant="ghost" className="h-8 w-8 text-destructive hover:bg-destructive/10 hover:text-destructive" onClick={() => removeTransform(i)}>
                         <Trash2 className="h-4 w-4" />
                       </Button>
                     </div>
@@ -806,26 +1194,54 @@ function Builder(props: {
                     {/* Step Fields configurations */}
                     {t.type === "keyword_filter" && (
                       <div className="space-y-3 text-sm">
+                        <p className="text-xs text-muted-foreground">
+                          Keep only chunks (or articles) that mention these terms. Saved keywords from the Keywords page can be included automatically.
+                        </p>
                         <div className="space-y-1">
-                          <Label className="text-xs">Keywords (comma-separated)</Label>
+                          <Label className="text-xs">Extra keywords (comma-separated)</Label>
                           <Input
                             placeholder="e.g. acquisitions, AI, deal"
                             value={t.keywords_str ?? ""}
                             onChange={(e) => updateTransform(i, { keywords_str: e.target.value })}
                           />
                         </div>
-                        <label className="flex items-center gap-2 cursor-pointer text-xs text-muted-foreground mt-1">
+                        <label className="flex items-center gap-2 cursor-pointer text-xs text-muted-foreground">
+                          <Checkbox
+                            checked={t.use_saved_keywords !== false}
+                            onCheckedChange={(c) => updateTransform(i, { use_saved_keywords: c === true })}
+                          />
+                          Use saved keywords{keywords.length ? ` (${keywords.length})` : ""}
+                        </label>
+                        {keywords.length > 0 && (
+                          <div className="flex flex-wrap gap-1">
+                            {keywords.slice(0, 12).map((kw) => (
+                              <Badge key={kw.id} variant="secondary" className="text-[10px] font-normal">{kw.word}</Badge>
+                            ))}
+                          </div>
+                        )}
+                        <label className="flex items-center gap-2 cursor-pointer text-xs text-muted-foreground">
                           <Checkbox
                             checked={!!t.match_all}
                             onCheckedChange={(c) => updateTransform(i, { match_all: c === true })}
                           />
-                          Match ALL keywords (AND logic) instead of ANY (OR logic)
+                          Match ALL keywords (AND) instead of ANY (OR)
                         </label>
                       </div>
                     )}
 
                     {t.type === "extract" && (
                       <div className="space-y-3">
+                        {t.role === "fetch" ? (
+                          <p className="text-xs text-muted-foreground">
+                            Download and clean the full article or page. No LLM yet — chunking and prompts run after this.
+                          </p>
+                        ) : t.role === "chunk" ? (
+                          <p className="text-xs text-muted-foreground">
+                            This prompt runs once per remaining chunk. Use a different prompt in the Article output step.
+                          </p>
+                        ) : null}
+                        {t.role !== "fetch" && (
+                          <>
                         <div className="space-y-1">
                           <Label className="text-xs">Extraction Mode</Label>
                           <select
@@ -853,13 +1269,13 @@ function Builder(props: {
                         {(t.mode === "llm" || t.mode === "auto") && (
                           <div className="rounded border bg-muted/30 p-3 space-y-3">
                             <div className="flex items-center justify-between">
-                              <Label className="text-xs font-semibold">LLM Extraction Settings</Label>
+                              <Label className="text-xs font-semibold">{t.role === "chunk" ? "Per-chunk prompt" : "LLM extraction"}</Label>
                               <label className="flex items-center gap-1.5 text-[10px] text-muted-foreground cursor-pointer">
                                 <Checkbox
                                   checked={!!t.llm?.enabled}
                                   onCheckedChange={(c) => updateTransform(i, { llm: { ...t.llm, enabled: c === true } })}
                                 />
-                                Enable LLM Stage
+                                Enable LLM
                               </label>
                             </div>
 
@@ -915,12 +1331,14 @@ function Builder(props: {
                                   <Input type="password" className="h-8 text-xs" value={t.llm?.api_key ?? ""} onChange={(e) => updateTransform(i, { llm: { ...t.llm, api_key: e.target.value } })} />
                                 </div>
                                 <div className="space-y-1">
-                                  <Label className="text-[10px]">Prompt</Label>
+                                  <Label className="text-[10px]">{t.role === "chunk" ? "Per-chunk prompt" : "Prompt"}</Label>
                                   <Textarea rows={3} className="text-xs" value={t.prompt ?? ""} onChange={(e) => updateTransform(i, { prompt: e.target.value })} placeholder="Extract structured fields." />
                                 </div>
                               </div>
                             )}
                           </div>
+                        )}
+                          </>
                         )}
                       </div>
                     )}
@@ -977,17 +1395,68 @@ function Builder(props: {
                       </div>
                     )}
 
+                    {t.type === "synthesize" && (
+                      <div className="space-y-3">
+                        <p className="text-xs text-muted-foreground">
+                          After every chunk has been extracted, this prompt sees all passage JSON for one article and writes the final record. It is a different prompt from the per-chunk step.
+                        </p>
+                        <div className="space-y-1">
+                          <Label className="text-xs">API configuration</Label>
+                          <select
+                            className="w-full rounded-md border bg-background px-3 py-1.5 text-xs font-medium"
+                            value={t.api_config_id ?? ""}
+                            onChange={(e) => {
+                              const id = e.target.value ? Number(e.target.value) : undefined;
+                              const cfg = apiConfigs.find((c) => c.id === id);
+                              updateTransform(i, {
+                                api_config_id: id,
+                                llm: cfg ? { ...t.llm, enabled: true, endpoint: cfg.endpoint, model: cfg.model } : t.llm,
+                              });
+                            }}
+                          >
+                            <option value="">Custom / inline</option>
+                            {apiConfigs.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
+                          </select>
+                        </div>
+                        <div className="space-y-1">
+                          <Label className="text-xs">Endpoint</Label>
+                          <Input className="h-8 text-xs" value={t.llm?.endpoint ?? ""} onChange={(e) => updateTransform(i, { llm: { ...t.llm, enabled: true, endpoint: e.target.value } })} />
+                        </div>
+                        <div className="space-y-1">
+                          <Label className="text-xs">Model</Label>
+                          <Input className="h-8 text-xs" value={t.llm?.model ?? ""} onChange={(e) => updateTransform(i, { llm: { ...t.llm, enabled: true, model: e.target.value } })} />
+                        </div>
+                        <div className="space-y-1">
+                          <Label className="text-xs">API key (never stored)</Label>
+                          <Input type="password" className="h-8 text-xs" value={t.llm?.api_key ?? ""} onChange={(e) => updateTransform(i, { llm: { ...t.llm, enabled: true, api_key: e.target.value } })} />
+                        </div>
+                        <div className="space-y-1">
+                          <Label className="text-xs">Article output prompt</Label>
+                          <Textarea rows={4} className="text-xs" value={t.prompt ?? ""} onChange={(e) => updateTransform(i, { prompt: e.target.value })} placeholder="Combine passage extracts into one record." />
+                        </div>
+                      </div>
+                    )}
+
                     {t.type === "chunk" && (
                       <div className="space-y-3">
-                        <label className="flex items-center gap-2 cursor-pointer text-xs text-muted-foreground">
-                          <Checkbox
-                            checked={!!t.generate_vectors}
-                            onCheckedChange={(c) => updateTransform(i, { generate_vectors: c === true })}
-                          />
-                          Generate vector embeddings (enables semantic searches)
-                        </label>
+                        <div className="flex flex-col gap-2">
+                          <label className="flex items-center gap-2 cursor-pointer text-xs text-muted-foreground">
+                            <Checkbox
+                              checked={!!t.generate_vectors}
+                              onCheckedChange={(c) => updateTransform(i, { generate_vectors: c === true })}
+                            />
+                            Generate vector embeddings (enables semantic search). Pick a real model — hash vectors are only a fallback.
+                          </label>
+                          <label className="flex items-center gap-2 cursor-pointer text-xs text-muted-foreground">
+                            <Checkbox
+                              checked={t.split_pipeline_stream !== false}
+                              onCheckedChange={(c) => updateTransform(i, { split_pipeline_stream: c === true })}
+                            />
+                            Split into chunks for the next steps (required for keyword filter + per-chunk extract)
+                          </label>
+                        </div>
 
-                        <div className="grid gap-2 sm:grid-cols-3">
+                        <div className="grid gap-2 sm:grid-cols-4">
                           <div className="space-y-1">
                             <Label className="text-[10px]">Chunk size</Label>
                             <Input
@@ -995,6 +1464,15 @@ function Builder(props: {
                               className="h-8 text-xs"
                               value={t.chunk_size ?? 800}
                               onChange={(e) => updateTransform(i, { chunk_size: Number(e.target.value) })}
+                            />
+                          </div>
+                          <div className="space-y-1">
+                            <Label className="text-[10px]">Overlap</Label>
+                            <Input
+                              type="number"
+                              className="h-8 text-xs"
+                              value={t.chunk_overlap ?? 120}
+                              onChange={(e) => updateTransform(i, { chunk_overlap: Number(e.target.value) })}
                             />
                           </div>
                           <div className="space-y-1">
@@ -1011,34 +1489,19 @@ function Builder(props: {
                               checked={!!t.filter_by_keywords}
                               onCheckedChange={(c) => updateTransform(i, { filter_by_keywords: c === true })}
                             />
-                            <Label className="text-[10px] text-muted-foreground">Filter by keywords</Label>
+                            <Label className="text-[10px] text-muted-foreground">Drop chunks that miss saved keywords</Label>
                           </div>
                         </div>
 
                         {t.generate_vectors && (
-                          <div className="grid gap-2 sm:grid-cols-2 bg-muted/20 p-2.5 rounded border">
-                            <div className="space-y-1">
-                              <Label className="text-[10px]">Embedding provider</Label>
-                              <select
-                                className="w-full rounded-md border bg-background px-2 py-1 text-xs h-8"
-                                value={t.provider ?? "local"}
-                                onChange={(e) => updateTransform(i, { provider: e.target.value })}
-                              >
-                                <option value="local">Local hash</option>
-                                <option value="openai">OpenAI-compatible</option>
-                                <option value="ollama">Ollama</option>
-                                <option value="lmstudio">LM Studio</option>
-                              </select>
-                            </div>
-                            <div className="space-y-1">
-                              <Label className="text-[10px]">Model</Label>
-                              <Input
-                                className="h-8 text-xs"
-                                value={t.model ?? "local-hash"}
-                                onChange={(e) => updateTransform(i, { model: e.target.value })}
-                              />
-                            </div>
-                          </div>
+                          <EmbeddingModelFields
+                            compact
+                            provider={t.provider ?? "local"}
+                            model={t.model ?? "local-hash"}
+                            endpoint={t.endpoint ?? ""}
+                            apiKey={t.api_key ?? ""}
+                            onChange={(patch) => updateTransform(i, patch)}
+                          />
                         )}
                       </div>
                     )}
@@ -1061,10 +1524,11 @@ function Builder(props: {
                     }}
                   >
                     <option value="" disabled>Select transform type...</option>
-                    <option value="keyword_filter">🔍 Keyword Filter</option>
-                    <option value="extract">✨ Schema Extraction</option>
-                    <option value="enrich_llm">🤖 AI Enrichment</option>
-                    <option value="chunk">📦 Vector Chunking</option>
+                    <option value="extract">Fetch or extract</option>
+                    <option value="chunk">Chunk long article</option>
+                    <option value="keyword_filter">Keyword filter</option>
+                    <option value="synthesize">Article output (combine chunks)</option>
+                    <option value="enrich_llm">AI enrichment</option>
                   </select>
                 </div>
               </div>
@@ -1074,8 +1538,59 @@ function Builder(props: {
           {step === 3 && (
             <div className="space-y-3">
               <p className="text-xs text-muted-foreground">
-                The schema is the hard contract every record must satisfy.
+                This schema is the final article record (after synthesis). Per-chunk extracts can be looser JSON; the article prompt should fill these fields.
               </p>
+              <div className="grid gap-3 sm:grid-cols-2">
+                <div className="space-y-1">
+                  <Label>Saved schema</Label>
+                  <select
+                    className="w-full rounded-md border bg-background px-3 py-2 text-sm"
+                    value={def.schema_id ?? ""}
+                    onChange={(e) => chooseSchema(e.target.value)}
+                  >
+                    <option value="">Custom fields</option>
+                    {schemas.map((s) => (
+                      <option key={s.id} value={s.id}>{s.name}</option>
+                    ))}
+                  </select>
+                  {schemas.length === 0 && (
+                    <p className="text-[11px] text-muted-foreground">
+                      None yet. <Link className="underline" to="/schemas">Create a schema</Link>
+                    </p>
+                  )}
+                </div>
+                <div className="space-y-1">
+                  <Label>Saved prompt (fills extract steps)</Label>
+                  <select
+                    className="w-full rounded-md border bg-background px-3 py-2 text-sm"
+                    value={def.prompt_id ?? ""}
+                    onChange={(e) => {
+                      const id = e.target.value ? Number(e.target.value) : undefined;
+                      const p = prompts.find((x) => x.id === id);
+                      const list = (def.transforms || []).map((t: any) => {
+                        if (t.type === "extract" && t.role !== "fetch") {
+                          return { ...t, prompt_id: id, prompt: p ? p.extraction_prompt : t.prompt };
+                        }
+                        if (t.type === "synthesize" && p) {
+                          return { ...t, prompt: p.extraction_prompt };
+                        }
+                        return t;
+                      });
+                      set({ prompt_id: id, prompt: p?.extraction_prompt ?? def.prompt, transforms: list });
+                    }}
+                  >
+                    <option value="">None</option>
+                    {prompts.map((p) => (
+                      <option key={p.id} value={p.id}>{p.name}</option>
+                    ))}
+                  </select>
+                  {prompts.length === 0 && (
+                    <p className="text-[11px] text-muted-foreground">
+                      Optional. <Link className="underline" to="/prompts">Save a prompt</Link>
+                    </p>
+                  )}
+                </div>
+              </div>
               {(def.fields || []).map((f, i) => (
                 <div key={i} className="grid grid-cols-[1fr_110px_1fr_1fr_auto] items-end gap-2">
                   <div className="space-y-1">
@@ -1122,24 +1637,30 @@ function Builder(props: {
           {step === 4 && (
             <div className="space-y-3">
               <div className="space-y-1">
-                <Label>Output</Label>
-                <p className="text-xs text-muted-foreground">Records are written to a DuckDB database.</p>
+                <Label>Where records go</Label>
+                <select
+                  className="w-full rounded-md border bg-background px-3 py-2 text-sm"
+                  value={def.output?.type ?? "duckdb"}
+                  onChange={(e) => set({ output: { ...def.output!, type: e.target.value } })}
+                >
+                  <option value="duckdb">DuckDB table</option>
+                  <option value="csv">CSV file</option>
+                  <option value="sqlite">SQLite file</option>
+                </select>
               </div>
 
-              {mappings.length > 0 && (
-                <div className="rounded-md border bg-muted/30 p-3">
-                  <Label className="text-xs">Use a saved Mapper mapping</Label>
-                  <div className="mt-2 flex gap-2">
-                    <select className="flex-1 rounded-md border bg-background px-3 py-2 text-sm" defaultValue="" onChange={(e) => e.target.value && applySavedMapping(e.target.value)}>
-                      <option value="">Select a saved mapping…</option>
-                      {mappings.map((m) => (
-                        <option key={m.id} value={m.id}>{m.name} · {m.table} ({m.columns.length} cols)</option>
-                      ))}
-                    </select>
-                  </div>
+              {(def.output?.type === "csv" || def.output?.type === "sqlite") && (
+                <div className="space-y-1">
+                  <Label>File path</Label>
+                  <Input
+                    value={def.output?.path ?? ""}
+                    onChange={(e) => set({ output: { ...def.output!, path: e.target.value } })}
+                    placeholder={def.output?.type === "csv" ? "~/autofeeder-output.csv" : "~/autofeeder-output.sqlite3"}
+                  />
                 </div>
               )}
 
+              {(def.output?.type ?? "duckdb") === "duckdb" && (
               <div className="space-y-3">
                   <div className="space-y-1">
                     <Label>DuckDB database</Label>
@@ -1189,7 +1710,7 @@ function Builder(props: {
                           {DUCK_TYPES.map((t) => <option key={t} value={t}>{t}</option>)}
                         </select>
                         <Button size="icon" variant="ghost" onClick={() => set({ output: { ...def.output!, mappings: (def.output?.mappings || []).filter((_, idx) => idx !== i) } })}>
-                          <Trash2 className="h-4 w-4 text-red-500" />
+                          <Trash2 className="h-4 w-4 text-destructive" />
                         </Button>
                       </div>
                     ))}
@@ -1203,7 +1724,80 @@ function Builder(props: {
                     />
                     <p className="text-xs text-muted-foreground">RSS metadata (url, source, author, published, categories) and run info are stored automatically as extra columns.</p>
                   </div>
+                  <div className="space-y-2 rounded-lg border p-3">
+                    <div className="flex items-center justify-between">
+                      <Label>Publish after this run</Label>
+                      <Link className="text-xs underline text-muted-foreground" to="/exports">Manage on Exports</Link>
+                    </div>
+                    <p className="text-[11px] text-muted-foreground">Live RSS/JSON from this DuckDB table. Create endpoints on Exports, then attach them here.</p>
+                    {channels.length === 0 && (
+                      <p className="text-xs text-muted-foreground">
+                        None yet.{" "}
+                        <Link className="underline" to="/exports?tab=publish">
+                          Create a publish endpoint
+                        </Link>
+                        , then attach it here.
+                      </p>
+                    )}
+                    {channels.map((ch) => {
+                      const ids = def.output?.publish_channel_ids || [];
+                      const on = ids.includes(ch.id);
+                      return (
+                        <label key={ch.id} className="flex items-center gap-2 text-sm cursor-pointer">
+                          <Checkbox
+                            checked={on}
+                            onCheckedChange={() =>
+                              set({
+                                output: {
+                                  ...def.output!,
+                                  publish_channel_ids: on ? ids.filter((x) => x !== ch.id) : [...ids, ch.id],
+                                },
+                              })
+                            }
+                          />
+                          <span className="truncate">{ch.name} · {ch.kind} · {ch.table}</span>
+                        </label>
+                      );
+                    })}
+                  </div>
+                  <div className="space-y-2 rounded-lg border p-3">
+                    <div className="flex items-center justify-between">
+                      <Label>Upsert sync after this run</Label>
+                      <Link className="text-xs underline text-muted-foreground" to="/exports">Manage on Exports</Link>
+                    </div>
+                    <p className="text-[11px] text-muted-foreground">Runs selected sync targets after rows are written.</p>
+                    {syncTargets.length === 0 && (
+                      <p className="text-xs text-muted-foreground">
+                        None yet.{" "}
+                        <Link className="underline" to="/exports?tab=sync">
+                          Create a sync target
+                        </Link>
+                        , then attach it here.
+                      </p>
+                    )}
+                    {syncTargets.map((t) => {
+                      const ids = def.output?.sync_target_ids || [];
+                      const on = ids.includes(t.id);
+                      return (
+                        <label key={t.id} className="flex items-center gap-2 text-sm cursor-pointer">
+                          <Checkbox
+                            checked={on}
+                            onCheckedChange={() =>
+                              set({
+                                output: {
+                                  ...def.output!,
+                                  sync_target_ids: on ? ids.filter((x) => x !== t.id) : [...ids, t.id],
+                                },
+                              })
+                            }
+                          />
+                          <span className="truncate">{t.name} · {t.kind}</span>
+                        </label>
+                      );
+                    })}
+                  </div>
               </div>
+              )}
             </div>
           )}
 
@@ -1213,6 +1807,54 @@ function Builder(props: {
                 <Label>Pipeline name</Label>
                 <Input value={def.name ?? ""} onChange={(e) => set({ name: e.target.value })} placeholder="My pipeline" />
               </div>
+              {issues.length > 0 && (
+                <div className="space-y-2 rounded-lg border border-dashed p-3">
+                  <div className="text-sm font-medium">Before you run</div>
+                  <ul className="list-disc space-y-1 pl-5 text-sm text-muted-foreground">
+                    {issues.map((w) => (
+                      <li key={w}>{w}</li>
+                    ))}
+                  </ul>
+                  {showLlmGap && (
+                    <Link to="/settings" className="inline-flex h-8 items-center gap-1 rounded-md border border-input px-3 text-xs font-medium hover:bg-accent">
+                      <Settings className="h-3.5 w-3.5" /> Open Settings
+                    </Link>
+                  )}
+                </div>
+              )}
+              <dl className="grid grid-cols-3 gap-2 rounded-lg border p-4 text-sm">
+                <dt className="text-muted-foreground">Sources</dt>
+                <dd className="col-span-2">
+                  {getSelectedFeedIds().length ? `${getSelectedFeedIds().length} feeds` : ""}
+                  {getSelectedFeedIds().length && (getSelectedWebsiteIds().length || getSelectedApiSourceIds().length || getSelectedSnapshotId()) ? " · " : ""}
+                  {getSelectedWebsiteIds().length ? `${getSelectedWebsiteIds().length} websites` : ""}
+                  {getSelectedWebsiteIds().length && (getSelectedApiSourceIds().length || getSelectedSnapshotId()) ? " · " : ""}
+                  {getSelectedApiSourceIds().length ? `${getSelectedApiSourceIds().length} APIs` : ""}
+                  {getSelectedApiSourceIds().length && getSelectedSnapshotId() ? " · " : ""}
+                  {getSelectedSnapshotId() ? "1 snapshot" : ""}
+                  {!hasSources(def) ? "None selected" : ""}
+                </dd>
+                <dt className="text-muted-foreground">Process</dt>
+                <dd className="col-span-2">{(def.transforms || []).length} step(s){usesLlm(def) ? (llmReady ? " · LLM ready" : " · LLM missing") : " · no LLM"}</dd>
+                <dt className="text-muted-foreground">Fields</dt>
+                <dd className="col-span-2">{(def.fields || []).filter((f) => f.name?.trim()).length || "None"}</dd>
+                <dt className="text-muted-foreground">Output</dt>
+                <dd className="col-span-2">{outputLabel(def)}</dd>
+                <dt className="text-muted-foreground">Publish</dt>
+                <dd className="col-span-2">
+                  {(def.output?.publish_channel_ids || []).length
+                    ? `${(def.output?.publish_channel_ids || []).length} channel(s)`
+                    : "None attached — create on Exports, then attach on Output"}
+                </dd>
+                <dt className="text-muted-foreground">Sync</dt>
+                <dd className="col-span-2">
+                  {(def.output?.sync_target_ids || []).length
+                    ? `${(def.output?.sync_target_ids || []).length} target(s)`
+                    : "None attached"}
+                </dd>
+                <dt className="text-muted-foreground">Schedule</dt>
+                <dd className="col-span-2">{scheduleLabel(def) || "Manual only"}</dd>
+              </dl>
               <div className="rounded-lg border p-3">
                 <label className="flex items-center gap-2 text-sm font-medium">
                   <Checkbox checked={!!def.schedule?.enabled} onCheckedChange={(c) => set({ schedule: { ...def.schedule!, enabled: c === true } })} />
@@ -1247,7 +1889,7 @@ function Builder(props: {
               <div className="rounded-lg border p-3">
                 <label className="flex items-center gap-2 text-sm font-medium">
                   <Checkbox checked={!!def.snapshot?.enabled} onCheckedChange={(c) => set({ snapshot: { ...def.snapshot!, enabled: c === true } })} />
-                  Also capture periodic snapshots
+                  Also capture periodic snapshots (no LLM required)
                 </label>
                 {def.snapshot?.enabled && (
                   <div className="mt-3 space-y-3">
@@ -1288,21 +1930,6 @@ function Builder(props: {
                 )}
               </div>
 
-              <dl className="grid grid-cols-3 gap-2 rounded-lg border p-4 text-sm">
-                <dt className="text-muted-foreground">Sources</dt>
-                <dd className="col-span-2">
-                  {getSelectedFeedIds().length ? `${getSelectedFeedIds().length} Feeds ` : ""}
-                  {getSelectedWebsiteIds().length ? `${getSelectedWebsiteIds().length} Websites ` : ""}
-                  {getSelectedApiSourceIds().length ? `${getSelectedApiSourceIds().length} APIs` : ""}
-                  {!getSelectedFeedIds().length && !getSelectedWebsiteIds().length && !getSelectedApiSourceIds().length ? "None selected" : ""}
-                </dd>
-                <dt className="text-muted-foreground">Transforms</dt>
-                <dd className="col-span-2">{(def.transforms || []).length} step(s) configured</dd>
-                <dt className="text-muted-foreground">Fields</dt>
-                <dd className="col-span-2">{(def.fields || []).length}</dd>
-                <dt className="text-muted-foreground">Output</dt>
-                <dd className="col-span-2">{def.output?.type}{def.output?.database ? ` · ${def.output.database}` : def.output?.path ? ` · ${def.output.path}` : ""}</dd>
-              </dl>
               <label className="flex items-center gap-2 text-sm">
                 <Checkbox checked={!!def.run_on_change} onCheckedChange={(c) => set({ run_on_change: c === true })} />
                 Run immediately after saving
@@ -1314,10 +1941,10 @@ function Builder(props: {
 
       <div className="flex items-center justify-between">
         <Button variant="outline" onClick={() => setStep(Math.max(0, step - 1))} disabled={step === 0}>
-          <ArrowLeft className="mr-1 h-4 w-4" /> Back
+          <ArrowLeft className="mr-1 h-4 w-4" /> Previous
         </Button>
         {step < 5 ? (
-          <Button onClick={() => setStep(Math.min(5, step + 1))}>
+          <Button onClick={goNext}>
             Next <ArrowRight className="ml-1 h-4 w-4" />
           </Button>
         ) : (

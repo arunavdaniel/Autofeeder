@@ -41,7 +41,7 @@ export interface PipelineDefinition {
   api_config_id?: number;
   prompt_id?: number;
   schema_id?: number;
-  output?: {
+    output?: {
     type: string;
     path?: string;
     database?: string;
@@ -49,6 +49,8 @@ export interface PipelineDefinition {
     mode?: string;
     mappings?: Mapping[];
     dedupe_key?: string;
+    publish_channel_ids?: number[];
+    sync_target_ids?: number[];
   };
   run_on_change?: boolean;
   retries?: number;
@@ -96,18 +98,42 @@ export interface DuckDBDatabase {
   path: string;
   description: string;
   created_at: string;
+  updated_at?: string | null;
   last_opened_at: string | null;
+  stats?: DuckDBDatabaseStats | null;
+}
+
+export interface DuckDBDatabaseStats {
+  path: string;
+  exists: boolean;
+  file_size_bytes: number | null;
+  file_created_at: string | null;
+  file_modified_at: string | null;
+  table_count: number;
+  total_rows: number;
+  tables: DuckDBTable[];
 }
 
 export interface DuckDBTable {
   name: string;
   rows: number | null;
+  columns?: number;
+  schema?: DuckDBColumnSchema[];
+}
+
+export interface DuckDBColumnSchema {
+  column: string;
+  type: string;
+  null: string;
 }
 
 export interface DuckDBQueryResult {
   columns: string[];
   rows: unknown[][];
   row_count: number;
+  total_rows?: number;
+  offset?: number;
+  limit?: number;
   error?: string;
 }
 
@@ -148,6 +174,9 @@ export interface WebsiteChange {
   status: string;
   detected_at: string;
   processed_at: string | null;
+  website_name?: string;
+  website_url?: string;
+  rows?: string;
 }
 
 export interface SearchResult {
@@ -172,6 +201,7 @@ export interface Pipeline {
 export interface RunSummary {
   id: number;
   pipeline_id: number;
+  pipeline_name?: string | null;
   preview: boolean;
   status: "queued" | "running" | "success" | "failed" | "cancelled";
   phase: string;
@@ -196,6 +226,7 @@ export interface RunLog {
 }
 
 export interface RunDetail extends RunSummary {
+  pipeline_name?: string;
   result: string;
   output_info: string;
   error: string;
@@ -210,34 +241,43 @@ export interface Folder {
 
 export interface Snapshot {
   id: number;
-  name: string;
-  kind: string;
-  source_label: string;
+  name?: string;
+  kind?: string;
+  type?: string;
+  source?: string;
+  source_label?: string;
   created_at: string;
-  article_count: number;
+  article_count?: number | null;
+  changed?: boolean | null;
+  backend?: string;
 }
 
-export interface SnapshotSchedule {
+export interface PublishChannel {
   id: number;
+  kind: "rss" | "json";
+  slug: string;
   name: string;
-  feed_ids: number[];
-  folder_ids: number[];
-  max_articles: number;
-  dest: { database: string; table?: string; mappings?: unknown[]; mode?: string; dedupe_key?: string } | null;
-  schedule: { enabled?: boolean; kind?: "interval" | "daily"; minutes?: number; time?: string };
-  enabled: boolean;
-  last_run: string | null;
-  created_at: string;
-}
-
-export interface SavedMapping {
-  id: number;
-  name: string;
-  schema_id: number | null;
   database: string;
   table: string;
-  columns: { source: string; target: string; type: string }[];
-  created_at: string;
+  sql?: string;
+  mapping?: Record<string, string>;
+  api_key?: string;
+  enabled: boolean;
+  urls?: { rss?: string | null; json?: string | null };
+}
+
+export interface SyncTarget {
+  id: number;
+  name: string;
+  kind: "sqlite" | "postgres" | "mysql" | "mssql" | "oracle";
+  database: string;
+  table: string;
+  sql?: string;
+  dest: { path?: string; dsn?: string; table?: string };
+  key_column: string;
+  schedule?: { enabled?: boolean; kind?: "interval" | "daily"; minutes?: number; time?: string };
+  enabled: boolean;
+  last_run: string | null;
 }
 
 export interface SnapshotArticle {
@@ -256,6 +296,8 @@ export interface SnapshotArticle {
 export interface Dashboard {
   folders: number;
   feeds: number;
+  websites?: number;
+  api_sources?: number;
   pipelines: number;
   active_pipelines: number;
   saved_articles: number;

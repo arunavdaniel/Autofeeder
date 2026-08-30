@@ -15,7 +15,7 @@ def test_html_to_text_removes_markup():
 def test_article_includes_all_page_links(monkeypatch):
     monkeypatch.setattr(
         "rss_reader.extractor.download_page",
-        lambda url: (
+        lambda url, use_browser=True: (
             '<html><body><h1>Story</h1><p>Full page text.</p><a href="/more">More</a></body></html>'
         ),
     )
@@ -27,7 +27,7 @@ def test_article_includes_all_page_links(monkeypatch):
 def test_article_uses_rendered_browser_html(monkeypatch):
     monkeypatch.setattr(
         "rss_reader.extractor.download_page",
-        lambda url: "<html><body><p>Rendered by browser</p></body></html>",
+        lambda url, use_browser=True: "<html><body><p>Rendered by browser</p></body></html>",
     )
     article = extract_article({"title": "Dynamic", "url": "https://example.com"})
     assert "Rendered by browser" in article["text"]

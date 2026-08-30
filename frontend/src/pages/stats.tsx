@@ -3,8 +3,17 @@ import { api } from "@/lib/api";
 import type { Folder, RunSummary, Snapshot } from "@/lib/types";
 import { BarChart, ChartCard, LineChart, StatCard } from "@/components/charts";
 import { Loader2 } from "lucide-react";
+import { PageShell } from "@/components/page-shell";
 
 type Point = { label: string; value: number };
+
+function snapshotLabel(s: Snapshot): string {
+  return (s.name || s.source || s.source_label || `Snapshot ${s.id}`).trim();
+}
+
+function shortLabel(value: string): string {
+  return value.length > 8 ? value.slice(0, 8) : value;
+}
 
 function bucketByDate(items: { created_at: string; value: number }[]): Point[] {
   const map = new Map<string, number>();
@@ -31,34 +40,33 @@ export function Stats() {
       api.duckdbDatabases().catch(() => []),
     ])
       .then(([f, s, r, d]) => {
-        setFolders(f as Folder[]);
-        setSnapshots(s as Snapshot[]);
-        setRuns((r as { runs: RunSummary[] }).runs);
-        setDbCount((d as unknown[]).length);
+        setFolders(Array.isArray(f) ? f : []);
+        setSnapshots(Array.isArray(s) ? s : []);
+        setRuns(Array.isArray((r as { runs?: RunSummary[] }).runs) ? (r as { runs: RunSummary[] }).runs : []);
+        setDbCount(Array.isArray(d) ? d.length : 0);
       })
       .finally(() => setBusy(false));
   }, []);
 
-  const totalFeeds = folders.reduce((n, f) => n + f.feeds.length, 0);
+  const totalFeeds = folders.reduce((n, f) => n + (f.feeds?.length || 0), 0);
   const totalSnapshots = snapshots.length;
-  const totalCaptured = snapshots.reduce((n, s) => n + (s.article_count || 0), 0);
+  const totalCaptured = snapshots.reduce((n, snap) => n + (snap.article_count || 0), 0);
   const totalRuns = runs.length;
-  const totalRecords = runs.reduce((n, r) => n + (r.records_count || 0), 0);
+  const totalRecords = runs.reduce((n, run) => n + (run.records_count || 0), 0);
 
   const feedsPerFolder: Point[] = folders
-    .map((f) => ({ label: f.name.length > 8 ? f.name.slice(0, 8) : f.name, value: f.feeds.length }))
+    .map((f) => ({ label: shortLabel(f.name || "Folder"), value: f.feeds?.length || 0 }))
     .filter((p) => p.value > 0);
 
-  const capturedOverTime = bucketByDate(snapshots.map((s) => ({ created_at: s.created_at, value: s.article_count || 0 })));
-  const recordsOverTime = bucketByDate(runs.map((r) => ({ created_at: r.created_at, value: r.records_count || 0 })));
+  const capturedOverTime = bucketByDate(
+    snapshots.map((snap) => ({ created_at: snap.created_at || "", value: snap.article_count || 0 })),
+  );
+  const recordsOverTime = bucketByDate(
+    runs.map((run) => ({ created_at: run.created_at || "", value: run.records_count || 0 })),
+  );
 
   return (
-    <div className="mx-auto max-w-6xl space-y-6 p-8">
-      <div>
-        <h1 className="text-2xl font-semibold tracking-tight">Stats</h1>
-        <p className="text-sm text-muted-foreground">Overview of your feeds, captures and extractions.</p>
-      </div>
-
+    <PageShell title="Stats" description="Overview of your feeds, captures and extractions." width="6xl">
       {busy ? (
         <div className="flex items-center gap-2 text-sm text-muted-foreground">
           <Loader2 className="h-4 w-4 animate-spin" /> Loading stats…
@@ -85,9 +93,10 @@ export function Stats() {
             <ChartCard title="Captured articles per snapshot">
               {snapshots.length ? (
                 <BarChart
-                  data={snapshots
-                    .slice(-12)
-                    .map((s) => ({ label: s.name.length > 8 ? s.name.slice(0, 8) : s.name, value: s.article_count || 0 }))}
+                  data={snapshots.slice(-12).map((snap) => ({
+                    label: shortLabel(snapshotLabel(snap)),
+                    value: snap.article_count || 0,
+                  }))}
                 />
               ) : (
                 <p className="text-sm text-muted-foreground">No snapshots yet.</p>
@@ -96,6 +105,6 @@ export function Stats() {
           </div>
         </>
       )}
-    </div>
+    </PageShell>
   );
 }

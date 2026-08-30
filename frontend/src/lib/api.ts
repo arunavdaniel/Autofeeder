@@ -8,45 +8,65 @@ import type {
   RunSummary,
   Snapshot,
   SnapshotArticle,
-  SnapshotSchedule,
-  SavedMapping,
   ApiConfig,
   PromptTemplate,
   SchemaDef,
   DuckDBDatabase,
+  DuckDBDatabaseStats,
   DuckDBTable,
   DuckDBQueryResult,
 } from "./types";
 
 const BASE = "/api";
 
-async function req<T>(path: string, options: RequestInit = {}): Promise<T> {
-  const res = await fetch(BASE + path, {
-    headers: { "Content-Type": "application/json", ...(options.headers || {}) },
-    ...options,
-  });
-  if (!res.ok) {
-    let message = res.statusText;
+async function req<T>(path: string, options: RequestInit = {}, retries = 0): Promise<T> {
+  let lastError: unknown;
+  for (let attempt = 0; attempt <= retries; attempt += 1) {
+    const controller = new AbortController();
+    const timer = window.setTimeout(() => controller.abort(), 45000);
     try {
-      const data = await res.json();
-      message = data.error || message;
-    } catch {
-      /* ignore */
+      const res = await fetch(BASE + path, {
+        headers: { "Content-Type": "application/json", ...(options.headers || {}) },
+        ...options,
+        signal: controller.signal,
+      });
+      window.clearTimeout(timer);
+      if (!res.ok) {
+        let message = res.statusText;
+        try {
+          const data = await res.json();
+          message = data.error || message;
+        } catch {
+          /* ignore */
+        }
+        throw new Error(message);
+      }
+      if (res.status === 204) return undefined as T;
+      return (await res.json()) as T;
+    } catch (error) {
+      window.clearTimeout(timer);
+      lastError = error;
+      if (attempt < retries) {
+        await new Promise((resolve) => window.setTimeout(resolve, 400 * (attempt + 1)));
+        continue;
+      }
     }
-    throw new Error(message);
   }
-  if (res.status === 204) return undefined as T;
-  return (await res.json()) as T;
+  if (lastError instanceof Error) throw lastError;
+  if (lastError instanceof DOMException && lastError.name === "AbortError") {
+    throw new Error("Request timed out. Is the backend server running?");
+  }
+  throw new Error("Could not reach the server. Start it with: python -m rss_reader.web");
 }
 
 export const api = {
   dashboard: () => req<Dashboard>("/dashboard"),
 
   pipelines: () => req<Pipeline[]>("/pipelines"),
-  savePipeline: (name: string, definition: PipelineDefinition) =>
+  savePipeline: (name: string, definition: PipelineDefinition, id?: number | null) =>
     req<{ id: number }>("/pipelines", {
       method: "POST",
-      body: JSON.stringify({ name, definition }),
+      body: JSON.stringify({ name, definition, id: id ?? undefined }),
     }),
   deletePipeline: (id: number) => req<void>(`/pipelines/${id}`, { method: "DELETE" }),
   runPipeline: (id: number, preview: boolean) =>
@@ -210,6 +230,51 @@ export const api = {
   getSettings: () => req<{ snapshot_retention: number; default_llm_endpoint: string; default_llm_model: string }>("/settings"),
   saveSettings: (payload: { snapshot_retention?: number; default_llm_endpoint?: string; default_llm_model?: string }) =>
     req<{ ok: true }>("/settings", { method: "POST", body: JSON.stringify(payload) }),
+  createBackup: async () => {
+    const res = await fetch(BASE + "/backup", { method: "POST" });
+    if (!res.ok) {
+      let message = res.statusText;
+      try {
+        const data = await res.json();
+        message = data.error || message;
+      } catch {
+        /* ignore */
+      }
+      throw new Error(message);
+    }
+    const blob = await res.blob();
+    const disposition = res.headers.get("Content-Disposition") || "";
+    const match = disposition.match(/filename="?([^";]+)"?/i);
+    const filename = match?.[1] || "autofeeder-backup.zip";
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = filename;
+    link.click();
+    URL.revokeObjectURL(url);
+    return { ok: true as const, filename };
+  },
+  restoreBackup: async (file: File) => {
+    const body = new FormData();
+    body.append("file", file);
+    const res = await fetch(BASE + "/restore", { method: "POST", body });
+    if (!res.ok) {
+      let message = res.statusText;
+      try {
+        const data = await res.json();
+        message = data.error || message;
+      } catch {
+        /* ignore */
+      }
+      throw new Error(message);
+    }
+    return (await res.json()) as {
+      ok: boolean;
+      restart_required: boolean;
+      safety_backup: string;
+      restored_duckdb_files: number;
+    };
+  },
   websiteSnapshotDetail: (id: number) => req<{ id: number; clean_text: string; raw_html: string; title: string; fetched_at: string }>(`/websites/snapshots/${id}`),
   apiSnapshotDetail: (id: number) => req<{ id: number; payload: string; fetched_at: string }>(`/api-sources/snapshots/${id}`),
   patchSnapshotArticle: (
@@ -231,22 +296,6 @@ export const api = {
   renameSnapshot: (id: number, name: string) =>
     req<{ ok: true }>(`/snapshots/${id}`, { method: "PATCH", body: JSON.stringify({ name }) }),
   deleteSnapshot: (id: number) => req<void>(`/snapshots/${id}`, { method: "DELETE" }),
-
-  snapshotSchedules: () => req<SnapshotSchedule[]>("/snapshot-schedules"),
-  createSnapshotSchedule: (payload: {
-    name: string;
-    feed_ids: number[];
-    folder_ids: number[];
-    max_articles?: number;
-    dest?: { database: string; table?: string; mappings?: unknown[]; mode?: string; dedupe_key?: string } | null;
-    schedule: { enabled?: boolean; kind?: "interval" | "daily"; minutes?: number; time?: string };
-  }) => req<{ id: number }>("/snapshot-schedules", { method: "POST", body: JSON.stringify(payload) }),
-  deleteSnapshotSchedule: (id: number) => req<void>(`/snapshot-schedules/${id}`, { method: "DELETE" }),
-
-  mappings: () => req<SavedMapping[]>("/mappings"),
-  saveMapping: (payload: { name: string; schema_id?: number | null; database: string; table: string; columns: { source: string; target: string; type: string }[] }) =>
-    req<{ id: number }>("/mappings", { method: "POST", body: JSON.stringify(payload) }),
-  deleteMapping: (id: number) => req<void>(`/mappings/${id}`, { method: "DELETE" }),
 
   captureSnapshot: (payload: {
     name?: string;
@@ -284,16 +333,30 @@ export const api = {
     req<{ ok: true; table: string }>("/duckdb/rename-table", { method: "POST", body: JSON.stringify(payload) }),
   duckdbTables: (db: string) =>
     req<{ tables: DuckDBTable[] }>(`/duckdb/tables?db=${encodeURIComponent(db)}`),
+  duckdbInfo: (db: string) =>
+    req<DuckDBDatabaseStats>(`/duckdb/info?db=${encodeURIComponent(db)}`),
   duckdbSchema: (db: string, table: string) =>
     req<{ schema: { column: string; type: string; null: string }[] }>(
       `/duckdb/schema?db=${encodeURIComponent(db)}&table=${encodeURIComponent(table)}`
     ),
-  duckdbPreview: (db: string, table: string, limit?: number) =>
+  duckdbPreview: (db: string, table: string, limit?: number, offset?: number) =>
     req<DuckDBQueryResult>(
-      `/duckdb/preview?db=${encodeURIComponent(db)}&table=${encodeURIComponent(table)}&limit=${limit ?? 100}`
+      `/duckdb/preview?db=${encodeURIComponent(db)}&table=${encodeURIComponent(table)}&limit=${limit ?? 100}&offset=${offset ?? 0}`
     ),
   duckdbQuery: (payload: { db: string; sql: string; readonly?: boolean; timeout?: number }) =>
     req<DuckDBQueryResult>("/duckdb/query", { method: "POST", body: JSON.stringify(payload) }),
+  duckdbSearch: (payload: {
+    db?: string;
+    databases?: string[];
+    query?: string;
+    keywords?: string;
+    table?: string;
+    column_filters?: Record<string, string>;
+  }) =>
+    req<{ results: Record<string, unknown>[]; count: number }>("/duckdb/search", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
   duckdbImport: (payload: { db: string; table: string; path: string }) =>
     req<{ table: string; rows: number }>("/duckdb/import", { method: "POST", body: JSON.stringify(payload) }),
   duckdbCreateTable: (payload: { database: string; table: string; columns: { name: string; type: string }[]; include_meta?: boolean }) =>
@@ -321,14 +384,35 @@ export const api = {
   deleteWebsite: (id: number) => req<void>(`/websites/${id}`, { method: "DELETE" }),
   checkWebsite: (id: number) => req<{ snapshot_id: number; change_id: number | null; changed: boolean; text: string }>(`/websites/${id}/check`, { method: "POST" }),
   websiteSnapshots: (id: number) => req<import("./types").WebsiteSnapshot[]>(`/websites/${id}/snapshots`),
-  websiteChanges: (id: number) => req<import("./types").WebsiteChange[]>(`/websites/${id}/changes`),
+  websiteChanges: (id: number, status?: string) =>
+    req<import("./types").WebsiteChange[]>(
+      `/websites/${id}/changes${status ? `?status=${encodeURIComponent(status)}` : ""}`
+    ),
+  allWebsiteChanges: (status?: string) =>
+    req<import("./types").WebsiteChange[]>(
+      `/websites/changes${status ? `?status=${encodeURIComponent(status)}` : ""}`
+    ),
   updateWebsiteChange: (id: number, status: string) => req<{ ok: true }>(`/websites/changes/${id}`, { method: "PATCH", body: JSON.stringify({ status }) }),
   extractWebsiteChange: (id: number) => req<{ run_ids: number[] }>(`/websites/changes/${id}/extract`, { method: "POST" }),
   openWebsiteSession: (id: number) => req<{ ok: boolean; started: boolean; message: string }>(`/websites/${id}/session/open`, { method: "POST" }),
   clearWebsiteSession: (id: number) => req<void>(`/websites/${id}/session`, { method: "DELETE" }),
   embeddingIndex: (payload: Record<string, unknown>) => req<{ chunks: number }>("/embeddings/index", { method: "POST", body: JSON.stringify(payload) }),
   embeddingSearch: (payload: Record<string, unknown>) => req<{ results: import("./types").SearchResult[] }>("/embeddings/search", { method: "POST", body: JSON.stringify(payload) }),
+  embeddingModels: () => req<{ providers: import("./embedding-models").EmbeddingProviderOption[]; default?: Record<string, unknown> }>("/embeddings/models"),
+  embeddingConfig: () => req<Record<string, unknown> & { catalog?: import("./embedding-models").EmbeddingProviderOption[] }>("/embeddings/config"),
+  saveEmbeddingConfig: (payload: Record<string, unknown>) =>
+    req<Record<string, unknown>>("/embeddings/config", { method: "POST", body: JSON.stringify(payload) }),
   exportTable: (db: string, table: string, format: string, path?: string) => req<Record<string, unknown>>(`/exports?db=${encodeURIComponent(db)}&table=${encodeURIComponent(table)}&format=${format}${path ? `&path=${encodeURIComponent(path)}` : ""}`),
+  publishChannels: () => req<import("./types").PublishChannel[]>("/publish"),
+  savePublishChannel: (payload: Record<string, unknown>) =>
+    req<import("./types").PublishChannel>("/publish", { method: "POST", body: JSON.stringify(payload) }),
+  deletePublishChannel: (id: number) => req<void>(`/publish/${id}`, { method: "DELETE" }),
+  syncTargets: () => req<import("./types").SyncTarget[]>("/sync-targets"),
+  syncKinds: () => req<Array<{ id: string; label: string; needs: string; placeholder?: string; install?: string | null }>>("/sync-kinds"),
+  saveSyncTarget: (payload: Record<string, unknown>) =>
+    req<import("./types").SyncTarget>("/sync-targets", { method: "POST", body: JSON.stringify(payload) }),
+  runSyncTarget: (id: number) => req<Record<string, unknown>>(`/sync-targets/${id}/run`, { method: "POST" }),
+  deleteSyncTarget: (id: number) => req<void>(`/sync-targets/${id}`, { method: "DELETE" }),
   apiSources: () => req<import("./types").ApiSource[]>("/api-sources"),
   saveApiSource: (payload: Record<string, unknown>, id?: number) =>
     req<{ id?: number; ok?: boolean }>(id ? `/api-sources/${id}` : "/api-sources", { method: id ? "PATCH" : "POST", body: JSON.stringify(payload) }),
@@ -343,4 +427,60 @@ export const api = {
   addKeyword: (payload: { word: string; category?: string }) =>
     req<{ id: number }>("/keywords", { method: "POST", body: JSON.stringify(payload) }),
   deleteKeyword: (id: number) => req<void>(`/keywords/${id}`, { method: "DELETE" }),
+
+  catalog: (kind: "feeds" | "apis" | "websites", opts?: { q?: string; category?: string; offset?: number; limit?: number }) => {
+    const q = new URLSearchParams({ kind });
+    if (opts?.q) q.set("q", opts.q);
+    if (opts?.category) q.set("category", opts.category);
+    if (opts?.offset != null) q.set("offset", String(opts.offset));
+    if (opts?.limit != null) q.set("limit", String(opts.limit));
+    return req<{
+      kind: string;
+      categories: string[];
+      items: Array<{
+        id: string;
+        title?: string;
+        name?: string;
+        url: string;
+        category: string;
+        description?: string;
+        installed?: boolean;
+        fetch_method?: string;
+        frequency?: string;
+      }>;
+      count: number;
+      total: number;
+      offset: number;
+      limit: number;
+    }>(`/catalog?${q.toString()}`, {}, 2);
+  },
+  catalogSummary: () =>
+    req<{
+      feeds: number;
+      apis: number;
+      websites: number;
+      categories: { feeds: string[]; apis: string[]; websites: string[] };
+      sources?: Record<
+        string,
+        {
+          id: string;
+          name: string;
+          repo: string;
+          description?: string;
+          count?: number;
+        }
+      >;
+    }>("/catalog/summary", {}, 2),
+  refreshCatalog: () =>
+    req<{ feeds: number; apis: number; websites: number }>("/catalog/refresh", { method: "POST" }, 1),
+  installCatalog: (payload: {
+    kind: "feeds" | "apis" | "websites";
+    ids?: string[];
+    category?: string;
+    folder?: string;
+  }) =>
+    req<{ added: number; skipped: number; errors: Array<{ id?: string; error: string }>; items: unknown[] }>(
+      "/catalog/install",
+      { method: "POST", body: JSON.stringify(payload) }
+    ),
 };

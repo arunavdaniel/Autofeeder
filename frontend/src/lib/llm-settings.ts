@@ -39,3 +39,11 @@ export function loadLLM(): LLMSettings {
 export function saveLLM(settings: LLMSettings): void {
   localStorage.setItem(KEY, JSON.stringify(settings));
 }
+
+export function localLlmReady(settings: LLMSettings = loadLLM()): boolean {
+  return Boolean(settings.endpoint?.trim() && settings.model?.trim());
+}
+
+export function configLlmReady(c: { endpoint?: string; model?: string }): boolean {
+  return Boolean(c.endpoint?.trim() && c.model?.trim());
+}

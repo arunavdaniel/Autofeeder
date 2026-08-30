@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "rss-text-reader"
 version = "0.1.0"
-description = "Autofeedly local RSS automation and extraction app"
+description = "Autofeeder local feed, web, and API extraction app"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -21,8 +21,20 @@ dependencies = [
 [project.scripts]
 rss-text-reader = "rss_reader.web:main"
 
+[project.optional-dependencies]
+sync = [
+    "psycopg[binary]>=3.1",
+    "pymysql>=1.1",
+    "pymssql>=2.3",
+    "oracledb>=2.4",
+]
+embeddings = ["sentence-transformers>=3"]
+
 [tool.setuptools.packages.find]
 include = ["rss_reader*"]
+
+[tool.setuptools.package-data]
+rss_reader = ["data/*.json", "data/catalog_snapshots/*.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
