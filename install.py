@@ -442,19 +442,33 @@ def write_launcher(install_dir: Path, venv_dir: Path, dry_run: bool) -> Path:
 
     if system == "Windows":
         launcher = install_dir / f"{LAUNCHER_NAME}.bat"
+        venv_exec = str(venv_bin(venv_dir) / "rss-text-reader.exe")
         content = (
             "@echo off\n"
-            f'"{venv_bin(venv_dir) / "rss-text-reader.exe"}" %*\n'
+            ":: Check if Autofeeder is already running\n"
+            "powershell -Command \"try { $r = Invoke-WebRequest http://127.0.0.1:8765/api/health"
+            " -UseBasicParsing -TimeoutSec 1 -ErrorAction Stop;"
+            " Start-Process http://127.0.0.1:8765; exit 0 } catch {} \"\n"
+            f'"{venv_exec}" %*\n'
         )
-        ext = ".bat"
     else:
         launcher = install_dir / LAUNCHER_NAME
-        venv_exec = venv_bin(venv_dir) / "rss-text-reader"
+        venv_exec = str(venv_bin(venv_dir) / "rss-text-reader")
         content = (
             "#!/bin/sh\n"
+            "# If already running, just open the browser\n"
+            "if command -v curl >/dev/null 2>&1; then\n"
+            "  if curl -fsS --max-time 1 http://127.0.0.1:8765/api/health >/dev/null 2>&1; then\n"
+            "    echo 'Autofeeder is already running — opening http://127.0.0.1:8765'\n"
+            "    case \"$(uname)\" in\n"
+            "      Darwin) open http://127.0.0.1:8765 ;;\n"
+            "      *) xdg-open http://127.0.0.1:8765 2>/dev/null || true ;;\n"
+            "    esac\n"
+            "    exit 0\n"
+            "  fi\n"
+            "fi\n"
             f'exec "{venv_exec}" "$@"\n'
         )
-        ext = ""
 
     if dry_run:
         info(f"[dry-run] Would write launcher: {launcher}")
@@ -642,15 +656,6 @@ def main() -> int:
     header("All done! 🎉")
     # ------------------------------------------------------------------ #
     print(green(bold("\n  Autofeeder installed successfully.\n")))
-    print(f"  Run it with:")
-    print(f"    {bold(str(launcher))}\n")
-    print(f"  Or activate the venv directly:")
-    if platform.system() == "Windows":
-        print(f"    {bold(str(venv_bin(venv_dir) / 'activate.bat'))}")
-        print(f"    {bold('rss-text-reader')}\n")
-    else:
-        activate = str(venv_bin(venv_dir) / "activate")
-        print(f"    {bold('source ' + activate + ' && rss-text-reader')}\n")
 
     suggest_path_addition(install_dir)
 
@@ -658,6 +663,21 @@ def main() -> int:
         f"  {dim('Uninstall anytime with:')}\n"
         f"    {bold('python3 install.py --uninstall')}\n"
     )
+
+    if args.dry_run:
+        info(f"[dry-run] Would launch: {launcher}")
+        return 0
+
+    print(green(bold("  Launching Autofeeder — opening http://127.0.0.1:8765 …\n")))
+    # exec() replaces the installer process with the app — clean, no zombie processes
+    rss_cmd = venv_bin(venv_dir) / (
+        "rss-text-reader.exe" if platform.system() == "Windows" else "rss-text-reader"
+    )
+    if rss_cmd.exists():
+        os.execv(str(rss_cmd), [str(rss_cmd)])
+    else:
+        # Fallback: run as a subprocess (e.g. when installed from a local zip path)
+        subprocess.call([str(venv_python), "-m", "rss_reader.web"])
     return 0
 
 
